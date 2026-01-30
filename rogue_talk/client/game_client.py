@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from asyncio import StreamReader, StreamWriter
 from typing import TYPE_CHECKING, Any
 
@@ -328,11 +329,13 @@ class GameClient:
                     self._position_queue.get(), timeout=0.1
                 )
                 if self.writer:
-                    await write_message(
-                        self.writer,
-                        MessageType.POSITION_UPDATE,
-                        serialize_position_update(seq, x, y),
-                    )
+                    # Write without drain() to avoid blocking on slow networks
+                    payload = serialize_position_update(seq, x, y)
+                    length = 1 + len(payload)
+                    self.writer.write(struct.pack(">I", length))
+                    self.writer.write(struct.pack("B", MessageType.POSITION_UPDATE))
+                    self.writer.write(payload)
+                    # Don't await drain - let it buffer
             except asyncio.TimeoutError:
                 continue
 
