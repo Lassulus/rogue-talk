@@ -43,7 +43,7 @@ TILES: dict[str, TileDef] = {
         walkable=False,
         color="red",
         bold=True,
-        animation_colors=["red", "red", "yellow", "red", "red", "yellow"],
+        animation_colors=["196", "124", "196", "124"],  # Bright red / dark red (256-color)
     ),  # Lava
     # Special
     "=": TileDef("=", walkable=True, color="yellow"),  # Bridge

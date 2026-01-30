@@ -207,6 +207,17 @@ class TerminalUI:
         tile_char = level.get_tile(x, y)
         return self._render_tile_with_lighting(tile_char, distance, x)
 
+    def _get_color_fn(self, color_name: str) -> str:
+        """Get color escape sequence for a color name or 256-color code."""
+        # Check if it's a numeric 256-color code
+        if color_name.isdigit():
+            return str(self.term.color(int(color_name)))  # type: ignore
+        # Named color
+        color_fn = getattr(self.term, color_name, None)
+        if color_fn:
+            return str(color_fn)
+        return ""
+
     def _render_tile_with_lighting(
         self, tile_char: str, distance: float, tile_x: int = 0
     ) -> str:
@@ -223,9 +234,14 @@ class TerminalUI:
         else:
             color_name = tile_def.color
 
+        # Check if using 256-color code
+        is_256_color = color_name.isdigit()
+
         # Apply lighting based on distance - gradual fade
         if distance <= LIGHT_FULL_RADIUS:
-            # Full brightness - use bold variant if available
+            # Full brightness
+            if is_256_color:
+                return str(self.term.color(int(color_name))(tile_def.char))  # type: ignore
             if not color_name.startswith("bold_"):
                 bold_color = f"bold_{color_name}"
                 if hasattr(self.term, bold_color):
@@ -236,7 +252,9 @@ class TerminalUI:
             return tile_def.char
 
         elif distance <= LIGHT_NORMAL_RADIUS:
-            # Normal brightness - strip bold if present
+            # Normal brightness
+            if is_256_color:
+                return str(self.term.color(int(color_name))(tile_def.char))  # type: ignore
             if color_name.startswith("bold_"):
                 color_name = color_name[5:]
             color_fn = getattr(self.term, color_name, None)
@@ -245,10 +263,13 @@ class TerminalUI:
             return tile_def.char
 
         elif distance <= LIGHT_DIM_RADIUS:
-            # Slightly dim - use dim + color
-            if color_name.startswith("bold_"):
-                color_name = color_name[5:]
-            color_attr = getattr(self.term, color_name, "")
+            # Slightly dim
+            if is_256_color:
+                color_attr = str(self.term.color(int(color_name)))  # type: ignore
+            else:
+                if color_name.startswith("bold_"):
+                    color_name = color_name[5:]
+                color_attr = getattr(self.term, color_name, "")
             return f"{self.term.dim}{color_attr}{tile_def.char}{self.term.normal}"
 
         elif distance <= LIGHT_DARKER_RADIUS:
