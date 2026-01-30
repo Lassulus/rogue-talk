@@ -21,6 +21,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["rogue_talk*"]
 
+[tool.setuptools.package-data]
+"rogue_talk.common" = ["*.json"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

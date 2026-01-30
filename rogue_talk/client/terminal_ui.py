@@ -229,8 +229,6 @@ class TerminalUI:
         if tile_def.animation_colors:
             anim_index = (self.anim_frame + tile_x) % len(tile_def.animation_colors)
             color_name = tile_def.animation_colors[anim_index]
-        elif tile_def.bold:
-            color_name = f"bold_{tile_def.color}"
         else:
             color_name = tile_def.color
 

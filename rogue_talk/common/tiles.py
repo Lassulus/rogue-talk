@@ -1,6 +1,8 @@
 """Tile definitions with visual and gameplay properties."""
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,47 +16,56 @@ class TileDef:
     char: str
     walkable: bool
     color: str  # blessed color name like "green", "blue", "white"
-    bold: bool = False
+    name: str = ""
+    walking_sound: str | None = None
+    nearby_sound: str | None = None
     # For animated tiles: list of colors to cycle through
     animation_colors: list[str] = field(default_factory=list)
+    blocks_sight: bool | None = None  # None means use !walkable as default
+    blocks_sound: bool | None = None  # None means use !walkable as default
+
+    def __post_init__(self) -> None:
+        """Set default values for blocks_sight and blocks_sound based on walkable."""
+        if self.blocks_sight is None:
+            self.blocks_sight = not self.walkable
+        if self.blocks_sound is None:
+            self.blocks_sound = not self.walkable
 
 
-# Tile definitions by character
-TILES: dict[str, TileDef] = {
-    # Walls and structures
-    "#": TileDef("#", walkable=False, color="white"),
-    "O": TileDef("O", walkable=False, color="white"),  # Pillar
-    "+": TileDef("+", walkable=True, color="yellow"),  # Door
-    # Floor types
-    ".": TileDef(".", walkable=True, color="white"),  # Stone floor
-    ",": TileDef(",", walkable=True, color="green"),  # Grass
-    ":": TileDef(":", walkable=True, color="white"),  # Gravel
-    "_": TileDef("_", walkable=True, color="yellow"),  # Sand
-    # Liquids (animated)
-    "~": TileDef(
-        "~",
-        walkable=False,
-        color="blue",
-        bold=True,
-        animation_colors=["blue", "cyan", "bold_blue", "bold_cyan"],
-    ),  # Water
-    "^": TileDef(
-        "^",
-        walkable=False,
-        color="red",
-        bold=True,
-        animation_colors=["196", "124", "196", "124"],  # Bright red / dark red (256-color)
-    ),  # Lava
-    # Special
-    "=": TileDef("=", walkable=True, color="yellow"),  # Bridge
-    "*": TileDef("*", walkable=False, color="yellow", bold=True),  # Crystal/treasure
-    "%": TileDef("%", walkable=False, color="green"),  # Bush/foliage
-    # Void/empty
-    " ": TileDef(" ", walkable=False, color="black"),
-}
+def _load_tiles_from_json() -> tuple[dict[str, TileDef], TileDef]:
+    """Load tile definitions from JSON file."""
+    json_path = Path(__file__).parent / "tiles.json"
 
-# Default tile for unknown characters
-DEFAULT_TILE = TileDef("?", walkable=False, color="magenta")
+    with open(json_path) as f:
+        data = json.load(f)
+
+    tiles: dict[str, TileDef] = {}
+
+    for char, tile_data in data["tiles"].items():
+        tiles[char] = TileDef(
+            char=char,
+            walkable=tile_data["walkable"],
+            color=tile_data["color"],
+            name=tile_data.get("name", ""),
+            walking_sound=tile_data.get("walking_sound"),
+            nearby_sound=tile_data.get("nearby_sound"),
+            animation_colors=tile_data.get("animation_colors") or [],
+            blocks_sight=tile_data.get("blocks_sight"),
+            blocks_sound=tile_data.get("blocks_sound"),
+        )
+
+    default_data = data["default"]
+    default_tile = TileDef(
+        char=default_data["symbol"],
+        walkable=default_data["walkable"],
+        color=default_data["color"],
+    )
+
+    return tiles, default_tile
+
+
+# Load tiles from JSON
+TILES, DEFAULT_TILE = _load_tiles_from_json()
 
 
 def get_tile(char: str) -> TileDef:
@@ -74,8 +85,6 @@ def render_tile(char: str, term: "Terminal", anim_frame: int = 0) -> str:
     # Determine color - use animation if available
     if tile.animation_colors:
         color_name = tile.animation_colors[anim_frame % len(tile.animation_colors)]
-    elif tile.bold:
-        color_name = f"bold_{tile.color}"
     else:
         color_name = tile.color
 
