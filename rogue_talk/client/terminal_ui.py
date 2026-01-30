@@ -1,20 +1,24 @@
-"""Terminal UI rendering with blessed."""
+"""Terminal UI rendering with blessed and viewport support."""
 
 from blessed import Terminal
 
 from ..common.protocol import PlayerInfo
+from .level import Level
+from .viewport import Viewport
 
 
 class TerminalUI:
     def __init__(self, terminal: Terminal):
         self.term = terminal
+        self.viewport = Viewport(width=40, height=20)
 
     def render(
         self,
-        room_width: int,
-        room_height: int,
+        level: Level,
         players: list[PlayerInfo],
         local_player_id: int,
+        player_x: int,
+        player_y: int,
         is_muted: bool,
         mic_level: float = 0.0,
     ) -> None:
@@ -24,13 +28,19 @@ class TerminalUI:
         # Clear screen and move to top
         output.append(self.term.home + self.term.clear)
 
-        # Draw the room
-        for y in range(room_height):
+        # Calculate camera position centered on player
+        cam_x, cam_y = self.viewport.calculate_camera(
+            player_x, player_y, level.width, level.height
+        )
+
+        # Draw the visible portion of the level
+        for vy in range(self.viewport.height):
             row = ""
-            for x in range(room_width):
-                char = self._get_cell_char(
-                    x, y, room_width, room_height, players, local_player_id
-                )
+            for vx in range(self.viewport.width):
+                # Convert viewport coordinates to level coordinates
+                lx = cam_x + vx
+                ly = cam_y + vy
+                char = self._get_cell_char(lx, ly, level, players, local_player_id)
                 row += char
             output.append(row)
 
@@ -73,8 +83,7 @@ class TerminalUI:
         self,
         x: int,
         y: int,
-        room_width: int,
-        room_height: int,
+        level: Level,
         players: list[PlayerInfo],
         local_player_id: int,
     ) -> str:
@@ -87,12 +96,8 @@ class TerminalUI:
                 else:
                     return str(self.term.bold_yellow("@"))
 
-        # Walls
-        if x == 0 or x == room_width - 1 or y == 0 or y == room_height - 1:
-            return "#"
-
-        # Empty floor
-        return "."
+        # Get tile from level (returns space for out-of-bounds)
+        return level.get_tile(x, y)
 
     def cleanup(self) -> None:
         """Restore terminal state."""

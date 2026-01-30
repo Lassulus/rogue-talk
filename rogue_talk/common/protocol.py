@@ -72,15 +72,27 @@ def deserialize_client_hello(data: bytes) -> str:
     return data[4 : 4 + name_len].decode("utf-8")
 
 
-# SERVER_HELLO: player_id, room_width, room_height, spawn_x, spawn_y
+# SERVER_HELLO: player_id, room_width, room_height, spawn_x, spawn_y, level_data
 def serialize_server_hello(
-    player_id: int, room_width: int, room_height: int, spawn_x: int, spawn_y: int
+    player_id: int,
+    room_width: int,
+    room_height: int,
+    spawn_x: int,
+    spawn_y: int,
+    level_data: bytes,
 ) -> bytes:
-    return struct.pack(">IHHHH", player_id, room_width, room_height, spawn_x, spawn_y)
+    base = struct.pack(">IHHHH", player_id, room_width, room_height, spawn_x, spawn_y)
+    level_length = struct.pack(">H", len(level_data))
+    return base + level_length + level_data
 
 
-def deserialize_server_hello(data: bytes) -> tuple[int, int, int, int, int]:
-    return struct.unpack(">IHHHH", data)
+def deserialize_server_hello(data: bytes) -> tuple[int, int, int, int, int, bytes]:
+    player_id, room_width, room_height, spawn_x, spawn_y = struct.unpack(
+        ">IHHHH", data[:12]
+    )
+    level_length = struct.unpack(">H", data[12:14])[0]
+    level_data = data[14 : 14 + level_length]
+    return player_id, room_width, room_height, spawn_x, spawn_y, level_data
 
 
 # POSITION_UPDATE: x, y

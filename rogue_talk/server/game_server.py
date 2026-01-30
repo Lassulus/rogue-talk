@@ -3,7 +3,6 @@
 import asyncio
 from asyncio import StreamReader, StreamWriter
 
-from ..common.constants import DEFAULT_ROOM_HEIGHT, DEFAULT_ROOM_WIDTH
 from ..common.protocol import (
     AudioFrame,
     MessageType,
@@ -21,15 +20,17 @@ from ..common.protocol import (
     write_message,
 )
 from .audio_router import get_audio_recipients
+from .level import Level
 from .player import Player
 from .world import World
 
 
 class GameServer:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, level_path: str = "./level.txt"):
         self.host = host
         self.port = port
-        self.world = World(DEFAULT_ROOM_WIDTH, DEFAULT_ROOM_HEIGHT)
+        self.level = Level.from_file(level_path)
+        self.world = World(self.level)
         self.players: dict[int, Player] = {}
         self.next_player_id = 1
         self._lock = asyncio.Lock()
@@ -60,7 +61,7 @@ class GameServer:
                 player = Player(player_id, name, spawn_x, spawn_y, reader, writer)
                 self.players[player_id] = player
 
-            # Send SERVER_HELLO
+            # Send SERVER_HELLO with level data
             await write_message(
                 writer,
                 MessageType.SERVER_HELLO,
@@ -70,6 +71,7 @@ class GameServer:
                     self.world.height,
                     spawn_x,
                     spawn_y,
+                    self.level.to_bytes(),
                 ),
             )
 

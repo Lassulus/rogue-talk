@@ -26,6 +26,7 @@ from ..common.protocol import (
     write_message,
 )
 from .input_handler import get_movement, is_mute_key, is_quit_key
+from .level import Level
 from .terminal_ui import TerminalUI
 
 if TYPE_CHECKING:
@@ -43,6 +44,7 @@ class GameClient:
         self.y: int = 0
         self.room_width: int = 0
         self.room_height: int = 0
+        self.level: Level | None = None
         self.is_muted: bool = False
         self.players: list[PlayerInfo] = []
         self.reader: StreamReader | None = None
@@ -76,9 +78,15 @@ class GameClient:
             print("Unexpected response from server")
             return False
 
-        self.player_id, self.room_width, self.room_height, self.x, self.y = (
-            deserialize_server_hello(payload)
-        )
+        (
+            self.player_id,
+            self.room_width,
+            self.room_height,
+            self.x,
+            self.y,
+            level_data,
+        ) = deserialize_server_hello(payload)
+        self.level = Level.from_bytes(level_data)
         return True
 
     async def run(self) -> None:
@@ -183,12 +191,12 @@ class GameClient:
             return
 
         movement = get_movement(key)
-        if movement and self.writer:
+        if movement and self.writer and self.level:
             dx, dy = movement
             new_x = self.x + dx
             new_y = self.y + dy
-            # Basic client-side validation
-            if 0 < new_x < self.room_width - 1 and 0 < new_y < self.room_height - 1:
+            # Client-side validation using level
+            if self.level.is_walkable(new_x, new_y):
                 self.x = new_x
                 self.y = new_y
                 await write_message(
@@ -213,12 +221,15 @@ class GameClient:
 
     def _render(self) -> None:
         """Render the current game state."""
+        if not self.level:
+            return
         mic_level = self.audio_capture.last_level if self.audio_capture else 0.0
         self.ui.render(
-            self.room_width,
-            self.room_height,
+            self.level,
             self.players,
             self.player_id,
+            self.x,
+            self.y,
             self.is_muted,
             mic_level,
         )

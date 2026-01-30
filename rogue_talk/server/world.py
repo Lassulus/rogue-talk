@@ -1,31 +1,30 @@
-"""Game world with room layout."""
+"""Game world with level-based layout."""
 
-import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+from .level import Level
 from .player import Player
 
 
 @dataclass
 class World:
-    width: int
-    height: int
-    # Simple room: walls on edges, open in the middle
+    level: Level
+
+    @property
+    def width(self) -> int:
+        return self.level.width
+
+    @property
+    def height(self) -> int:
+        return self.level.height
 
     def is_valid_position(self, x: int, y: int) -> bool:
-        """Check if position is walkable (not a wall)."""
-        # Walls on the border
-        if x <= 0 or x >= self.width - 1:
-            return False
-        if y <= 0 or y >= self.height - 1:
-            return False
-        return True
+        """Check if position is walkable."""
+        return self.level.is_walkable(x, y)
 
     def get_spawn_position(self) -> tuple[int, int]:
-        """Get a random valid spawn position."""
-        x = random.randint(1, self.width - 2)
-        y = random.randint(1, self.height - 2)
-        return x, y
+        """Get a valid spawn position."""
+        return self.level.get_spawn_position()
 
     def try_move(self, player: Player, dx: int, dy: int) -> bool:
         """Try to move player by delta. Returns True if successful."""
