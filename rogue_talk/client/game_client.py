@@ -116,10 +116,18 @@ class GameClient:
                 self._render()
                 render_counter = 0
                 while self.running:
-                    # Non-blocking input check
-                    key = self.term.inkey(timeout=0.05)
-                    if key:
+                    # Drain all pending input (process buffered keys immediately)
+                    had_input = False
+                    while True:
+                        key = self.term.inkey(timeout=0)
+                        if not key:
+                            break
+                        had_input = True
                         await self._handle_input(key)
+
+                    # If no input, do a short sleep to avoid busy-waiting
+                    if not had_input:
+                        await asyncio.sleep(0.016)  # ~60fps
 
                     # Periodic render for mic level
                     render_counter += 1
