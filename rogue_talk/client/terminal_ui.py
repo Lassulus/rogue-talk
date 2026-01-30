@@ -17,6 +17,9 @@ LIGHT_DARKER_RADIUS = 26  # Darker (gray tones)
 LIGHT_FADING_RADIUS = 32  # Very dark, almost invisible
 # Beyond LIGHT_FADING_RADIUS: invisible
 
+# Tiles that block light
+LIGHT_BLOCKING_TILES = {"#", "O"}  # Walls and pillars
+
 
 class TerminalUI:
     def __init__(self, terminal: Terminal):
@@ -30,6 +33,48 @@ class TerminalUI:
         height = max(10, self.term.height - reserved_lines)
         width = max(20, self.term.width)
         return Viewport(width=width, height=height)
+
+    def _has_line_of_sight(
+        self, x1: int, y1: int, x2: int, y2: int, level: Level
+    ) -> bool:
+        """Check if there's a clear line of sight between two points.
+
+        Uses Bresenham's line algorithm to trace the path.
+        Returns True if no light-blocking tiles are in the way.
+        """
+        # Same position - always visible
+        if x1 == x2 and y1 == y2:
+            return True
+
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+
+        x, y = x1, y1
+
+        while True:
+            # Check if we've reached the target (don't check the target itself)
+            if x == x2 and y == y2:
+                return True
+
+            # Check if current tile blocks light (skip the starting position)
+            if (x != x1 or y != y1):
+                tile = level.get_tile(x, y)
+                if tile in LIGHT_BLOCKING_TILES:
+                    return False
+
+            # Move to next cell
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+
+        return True
 
     def render(
         self,
@@ -124,6 +169,11 @@ class TerminalUI:
 
         # Beyond visibility range - show empty
         if distance > LIGHT_FADING_RADIUS:
+            return " "
+
+        # Check line of sight - walls block light
+        # The first wall hit IS visible (ray reaches it), but nothing behind it
+        if not self._has_line_of_sight(player_x, player_y, x, y, level):
             return " "
 
         # Check for players at this position
