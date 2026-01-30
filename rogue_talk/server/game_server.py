@@ -15,6 +15,7 @@ from ..common.protocol import (
     serialize_audio_frame,
     serialize_player_joined,
     serialize_player_left,
+    serialize_position_ack,
     serialize_server_hello,
     serialize_world_state,
     write_message,
@@ -102,7 +103,7 @@ class GameServer:
         self, player: Player, msg_type: MessageType, payload: bytes
     ) -> None:
         if msg_type == MessageType.POSITION_UPDATE:
-            x, y = deserialize_position_update(payload)
+            seq, x, y = deserialize_position_update(payload)
             # Validate the move (should be adjacent)
             dx = x - player.x
             dy = y - player.y
@@ -110,7 +111,16 @@ class GameServer:
                 if self.world.is_valid_position(x, y):
                     player.x = x
                     player.y = y
-                    await self._broadcast_world_state()
+            # Always send ACK with authoritative position (even if move was rejected)
+            try:
+                await write_message(
+                    player.writer,
+                    MessageType.POSITION_ACK,
+                    serialize_position_ack(seq, player.x, player.y),
+                )
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            await self._broadcast_world_state()
 
         elif msg_type == MessageType.AUDIO_FRAME:
             frame = deserialize_audio_frame(payload)

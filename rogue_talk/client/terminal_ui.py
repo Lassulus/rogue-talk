@@ -60,7 +60,7 @@ class TerminalUI:
                 return True
 
             # Check if current tile blocks light (skip the starting position)
-            if (x != x1 or y != y1):
+            if x != x1 or y != y1:
                 tile = level.get_tile(x, y)
                 if tile in LIGHT_BLOCKING_TILES:
                     return False

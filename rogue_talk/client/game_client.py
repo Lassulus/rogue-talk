@@ -16,6 +16,7 @@ from ..common.protocol import (
     deserialize_audio_frame,
     deserialize_player_joined,
     deserialize_player_left,
+    deserialize_position_ack,
     deserialize_server_hello,
     deserialize_world_state,
     read_message,
@@ -56,6 +57,9 @@ class GameClient:
         self.audio_playback: AudioPlayback | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._audio_queue: asyncio.Queue[tuple[bytes, int]] | None = None
+        # Client-side prediction: track pending (unacked) moves
+        self._move_seq: int = 0
+        self._pending_moves: dict[int, tuple[int, int]] = {}  # seq -> (dx, dy)
 
     async def connect(self) -> bool:
         """Connect to the server and complete handshake."""
@@ -153,12 +157,33 @@ class GameClient:
         if msg_type == MessageType.WORLD_STATE:
             world_state = deserialize_world_state(payload)
             self.players = world_state.players
-            # Update our local position from server state
-            for p in self.players:
-                if p.player_id == self.player_id:
-                    self.x = p.x
-                    self.y = p.y
-                    break
+            # Only update our position from server if no pending moves
+            # (otherwise we'd rubber-band while moves are in-flight)
+            if not self._pending_moves:
+                for p in self.players:
+                    if p.player_id == self.player_id:
+                        self.x = p.x
+                        self.y = p.y
+                        break
+            self._render()
+
+        elif msg_type == MessageType.POSITION_ACK:
+            seq, server_x, server_y = deserialize_position_ack(payload)
+            # Remove this move and all older moves from pending
+            seqs_to_remove = [s for s in self._pending_moves if s <= seq]
+            for s in seqs_to_remove:
+                del self._pending_moves[s]
+            # Reconcile: replay pending moves from server position
+            self.x = server_x
+            self.y = server_y
+            if self._pending_moves and self.level:
+                for move_seq in sorted(self._pending_moves.keys()):
+                    dx, dy = self._pending_moves[move_seq]
+                    new_x = self.x + dx
+                    new_y = self.y + dy
+                    if self.level.is_walkable(new_x, new_y):
+                        self.x = new_x
+                        self.y = new_y
             self._render()
 
         elif msg_type == MessageType.PLAYER_JOINED:
@@ -195,14 +220,17 @@ class GameClient:
             dx, dy = movement
             new_x = self.x + dx
             new_y = self.y + dy
-            # Client-side validation using level
+            # Client-side prediction: apply locally and track for reconciliation
             if self.level.is_walkable(new_x, new_y):
+                self._move_seq += 1
+                seq = self._move_seq
+                self._pending_moves[seq] = (dx, dy)
                 self.x = new_x
                 self.y = new_y
                 await write_message(
                     self.writer,
                     MessageType.POSITION_UPDATE,
-                    serialize_position_update(new_x, new_y),
+                    serialize_position_update(seq, new_x, new_y),
                 )
                 self._render()
 

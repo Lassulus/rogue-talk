@@ -15,6 +15,7 @@ class MessageType(enum.IntEnum):
     PLAYER_JOINED = 0x06
     PLAYER_LEFT = 0x07
     MUTE_STATUS = 0x08
+    POSITION_ACK = 0x09  # Server acknowledges a position update
 
 
 @dataclass
@@ -95,13 +96,22 @@ def deserialize_server_hello(data: bytes) -> tuple[int, int, int, int, int, byte
     return player_id, room_width, room_height, spawn_x, spawn_y, level_data
 
 
-# POSITION_UPDATE: x, y
-def serialize_position_update(x: int, y: int) -> bytes:
-    return struct.pack(">HH", x, y)
+# POSITION_UPDATE: seq, x, y
+def serialize_position_update(seq: int, x: int, y: int) -> bytes:
+    return struct.pack(">IHH", seq, x, y)
 
 
-def deserialize_position_update(data: bytes) -> tuple[int, int]:
-    return struct.unpack(">HH", data)
+def deserialize_position_update(data: bytes) -> tuple[int, int, int]:
+    return struct.unpack(">IHH", data)
+
+
+# POSITION_ACK: seq, x, y (server's authoritative position after processing move)
+def serialize_position_ack(seq: int, x: int, y: int) -> bytes:
+    return struct.pack(">IHH", seq, x, y)
+
+
+def deserialize_position_ack(data: bytes) -> tuple[int, int, int]:
+    return struct.unpack(">IHH", data)
 
 
 # WORLD_STATE: list of players
