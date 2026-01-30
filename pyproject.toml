@@ -1,0 +1,22 @@
+[project]
+name = "rogue-talk"
+version = "0.1.0"
+description = "Proximity-based voice chat roguelike"
+requires-python = ">=3.11"
+dependencies = [
+    "blessed",
+    "sounddevice",
+    "opuslib",
+    "numpy",
+]
+
+[project.scripts]
+rogue-talk-server = "rogue_talk.server.main:main"
+rogue-talk-client = "rogue_talk.client.main:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rogue_talk*"]
