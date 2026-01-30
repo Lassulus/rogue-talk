@@ -32,9 +32,10 @@ class TileDef:
             self.blocks_sound = not self.walkable
 
 
-def _load_tiles_from_json() -> tuple[dict[str, TileDef], TileDef]:
+def _load_tiles_from_json(json_path: Path | None = None) -> tuple[dict[str, TileDef], TileDef]:
     """Load tile definitions from JSON file."""
-    json_path = Path(__file__).parent / "tiles.json"
+    if json_path is None:
+        json_path = Path(__file__).parent / "tiles.json"
 
     with open(json_path) as f:
         data = json.load(f)
@@ -62,6 +63,31 @@ def _load_tiles_from_json() -> tuple[dict[str, TileDef], TileDef]:
     )
 
     return tiles, default_tile
+
+
+def load_tiles_from_path(path: Path | str) -> tuple[dict[str, TileDef], TileDef]:
+    """Load tile definitions from a specific JSON file path.
+
+    Args:
+        path: Path to tiles.json file
+
+    Returns:
+        Tuple of (tiles dict, default tile)
+    """
+    return _load_tiles_from_json(Path(path))
+
+
+def reload_tiles(path: Path | str | None = None) -> None:
+    """Reload tile definitions, optionally from a new path.
+
+    This updates the global TILES and DEFAULT_TILE variables.
+
+    Args:
+        path: Optional path to tiles.json. If None, reloads from default location.
+    """
+    global TILES, DEFAULT_TILE
+    json_path = Path(path) if path else None
+    TILES, DEFAULT_TILE = _load_tiles_from_json(json_path)
 
 
 # Load tiles from JSON

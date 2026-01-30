@@ -1,7 +1,10 @@
 """Main game server handling connections and game state."""
 
 import asyncio
+import io
+import tarfile
 from asyncio import StreamReader, StreamWriter
+from pathlib import Path
 
 from ..common.protocol import (
     AudioFrame,
@@ -9,10 +12,12 @@ from ..common.protocol import (
     PlayerInfo,
     deserialize_audio_frame,
     deserialize_client_hello,
+    deserialize_level_pack_request,
     deserialize_mute_status,
     deserialize_position_update,
     read_message,
     serialize_audio_frame,
+    serialize_level_pack_data,
     serialize_player_joined,
     serialize_player_left,
     serialize_position_ack,
@@ -27,14 +32,53 @@ from .world import World
 
 
 class GameServer:
-    def __init__(self, host: str, port: int, level_path: str = "./level.txt"):
+    def __init__(self, host: str, port: int, levels_dir: str = "./levels"):
         self.host = host
         self.port = port
-        self.level = Level.from_file(level_path)
+        self.levels_dir = Path(levels_dir)
+        self.level_packs: dict[str, bytes] = {}  # name -> tarball bytes
+        self._load_level_packs()
+        # Load "main" level for the world
+        self.level = self._extract_level_from_pack("main")
         self.world = World(self.level)
         self.players: dict[int, Player] = {}
         self.next_player_id = 1
         self._lock = asyncio.Lock()
+
+    def _load_level_packs(self) -> None:
+        """Load all .tar level packs from the levels directory."""
+        if not self.levels_dir.exists():
+            raise FileNotFoundError(
+                f"Levels directory not found: {self.levels_dir}"
+            )
+
+        for tar_path in self.levels_dir.glob("*.tar"):
+            name = tar_path.stem  # filename without .tar extension
+            with open(tar_path, "rb") as f:
+                self.level_packs[name] = f.read()
+            print(f"Loaded level pack: {name}")
+
+        if "main" not in self.level_packs:
+            raise FileNotFoundError(
+                f"Required level pack 'main.tar' not found in {self.levels_dir}"
+            )
+
+    def _extract_level_from_pack(self, name: str) -> Level:
+        """Extract and load a Level from a level pack."""
+        if name not in self.level_packs:
+            raise ValueError(f"Level pack '{name}' not found")
+
+        tarball_data = self.level_packs[name]
+        with tarfile.open(fileobj=io.BytesIO(tarball_data), mode="r:*") as tar:
+            # Find level.txt in the tarball
+            for member in tar.getmembers():
+                if member.name == "level.txt" or member.name.endswith("/level.txt"):
+                    level_file = tar.extractfile(member)
+                    if level_file:
+                        content = level_file.read().decode("utf-8")
+                        return Level.from_string(content)
+
+        raise ValueError(f"level.txt not found in level pack '{name}'")
 
     async def start(self) -> None:
         server = await asyncio.start_server(
@@ -48,8 +92,14 @@ class GameServer:
     async def handle_client(self, reader: StreamReader, writer: StreamWriter) -> None:
         player: Player | None = None
         try:
-            # Wait for CLIENT_HELLO
+            # First message should be LEVEL_PACK_REQUEST
             msg_type, payload = await read_message(reader)
+            if msg_type == MessageType.LEVEL_PACK_REQUEST:
+                level_name = deserialize_level_pack_request(payload)
+                await self._handle_level_pack_request(writer, level_name)
+                # Now wait for CLIENT_HELLO
+                msg_type, payload = await read_message(reader)
+
             if msg_type != MessageType.CLIENT_HELLO:
                 return
 
@@ -98,6 +148,24 @@ class GameServer:
                 await self._broadcast_player_left(player.id)
                 print(f"Player {player.name} (id={player.id}) left")
                 writer.close()
+
+    async def _handle_level_pack_request(
+        self, writer: StreamWriter, level_name: str
+    ) -> None:
+        """Handle a LEVEL_PACK_REQUEST message."""
+        if level_name in self.level_packs:
+            tarball = self.level_packs[level_name]
+            print(f"Sending level pack: {level_name} ({len(tarball)} bytes)")
+        else:
+            # Level not found - send empty response
+            tarball = b""
+            print(f"Level pack not found: {level_name}")
+
+        await write_message(
+            writer,
+            MessageType.LEVEL_PACK_DATA,
+            serialize_level_pack_data(tarball),
+        )
 
     async def _handle_message(
         self, player: Player, msg_type: MessageType, payload: bytes

@@ -21,7 +21,13 @@ class Level:
     def from_file(cls, path: str) -> Level:
         """Load a level from an ASCII text file."""
         with open(path, encoding="utf-8") as f:
-            lines = f.read().rstrip("\n").split("\n")
+            content = f.read()
+        return cls.from_string(content)
+
+    @classmethod
+    def from_string(cls, content: str) -> Level:
+        """Load a level from an ASCII string."""
+        lines = content.rstrip("\n").split("\n")
 
         # Determine dimensions
         height = len(lines)

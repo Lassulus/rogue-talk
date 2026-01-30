@@ -16,6 +16,8 @@ class MessageType(enum.IntEnum):
     PLAYER_LEFT = 0x07
     MUTE_STATUS = 0x08
     POSITION_ACK = 0x09  # Server acknowledges a position update
+    LEVEL_PACK_REQUEST = 0x10  # Client -> Server: Request level by name
+    LEVEL_PACK_DATA = 0x11  # Server -> Client: Tarball bytes
 
 
 @dataclass
@@ -188,3 +190,24 @@ def serialize_mute_status(is_muted: bool) -> bytes:
 
 def deserialize_mute_status(data: bytes) -> bool:
     return bool(struct.unpack("B", data)[0])
+
+
+# LEVEL_PACK_REQUEST: name (UTF-8 string)
+def serialize_level_pack_request(name: str) -> bytes:
+    name_bytes = name.encode("utf-8")
+    return struct.pack(">H", len(name_bytes)) + name_bytes
+
+
+def deserialize_level_pack_request(data: bytes) -> str:
+    name_len = struct.unpack(">H", data[:2])[0]
+    return data[2 : 2 + name_len].decode("utf-8")
+
+
+# LEVEL_PACK_DATA: tarball bytes (length-prefixed)
+def serialize_level_pack_data(tarball: bytes) -> bytes:
+    return struct.pack(">I", len(tarball)) + tarball
+
+
+def deserialize_level_pack_data(data: bytes) -> bytes:
+    tarball_len = struct.unpack(">I", data[:4])[0]
+    return data[4 : 4 + tarball_len]

@@ -13,9 +13,14 @@ def main() -> None:
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help="Port to bind to"
     )
+    parser.add_argument(
+        "--levels-dir",
+        default="./levels",
+        help="Directory containing level pack .tar files (default: ./levels)",
+    )
     args = parser.parse_args()
 
-    server = GameServer(args.host, args.port)
+    server = GameServer(args.host, args.port, levels_dir=args.levels_dir)
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import socket
 import struct
+import tempfile
 from asyncio import StreamReader, StreamWriter
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from blessed import Terminal
@@ -16,6 +18,7 @@ from ..common.protocol import (
     MessageType,
     PlayerInfo,
     deserialize_audio_frame,
+    deserialize_level_pack_data,
     deserialize_player_joined,
     deserialize_player_left,
     deserialize_position_ack,
@@ -24,12 +27,15 @@ from ..common.protocol import (
     read_message,
     serialize_audio_frame,
     serialize_client_hello,
+    serialize_level_pack_request,
     serialize_mute_status,
     serialize_position_update,
     write_message,
 )
+from ..common import tiles as tile_defs
 from .input_handler import get_movement, is_mute_key, is_quit_key
 from .level import Level
+from .level_pack import extract_level_pack
 from .terminal_ui import TerminalUI
 
 if TYPE_CHECKING:
@@ -64,6 +70,8 @@ class GameClient:
         # Client-side prediction: track pending (unacked) moves
         self._move_seq: int = 0
         self._pending_moves: dict[int, tuple[int, int]] = {}  # seq -> (dx, dy)
+        # Temporary directory for level pack extraction
+        self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
     async def connect(self) -> bool:
         """Connect to the server and complete handshake."""
@@ -74,6 +82,37 @@ class GameClient:
         except (ConnectionRefusedError, OSError) as e:
             print(f"Failed to connect: {e}")
             return False
+
+        # Request level pack first
+        await write_message(
+            self.writer,
+            MessageType.LEVEL_PACK_REQUEST,
+            serialize_level_pack_request("main"),
+        )
+
+        # Wait for LEVEL_PACK_DATA
+        msg_type, payload = await read_message(self.reader)
+        if msg_type != MessageType.LEVEL_PACK_DATA:
+            print("Unexpected response from server (expected LEVEL_PACK_DATA)")
+            return False
+
+        tarball_data = deserialize_level_pack_data(payload)
+        if not tarball_data:
+            print("Server returned empty level pack")
+            return False
+
+        # Extract level pack to temp directory
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="rogue_talk_")
+        extract_dir = Path(self._temp_dir.name)
+        try:
+            level_pack = extract_level_pack(tarball_data, extract_dir)
+        except ValueError as e:
+            print(f"Failed to extract level pack: {e}")
+            return False
+
+        # Load custom tiles if present
+        if level_pack.tiles_path:
+            tile_defs.reload_tiles(level_pack.tiles_path)
 
         # Send CLIENT_HELLO
         await write_message(
@@ -150,6 +189,8 @@ class GameClient:
             await self._stop_audio()
             if self.writer:
                 self.writer.close()
+            if self._temp_dir:
+                self._temp_dir.cleanup()
             self.ui.cleanup()
 
     async def _receive_messages(self) -> None:
