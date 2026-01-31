@@ -556,8 +556,18 @@ class GameServer:
             # Send initial world state (via data channel)
             await self._send_world_state(player)
 
+            # Start ping loop to detect disconnects
+            ping_task = asyncio.create_task(self._ping_loop(player, connection_closed))
+
             # Wait for WebRTC connection to close
-            await connection_closed.wait()
+            try:
+                await connection_closed.wait()
+            finally:
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
 
         except (
             asyncio.IncompleteReadError,
@@ -673,8 +683,10 @@ class GameServer:
         ):
             pass  # Client disconnected
 
-    async def _ping_loop(self, player: Player) -> None:
-        """Send periodic pings to check if client is alive (legacy TCP)."""
+    async def _ping_loop(
+        self, player: Player, connection_closed: asyncio.Event
+    ) -> None:
+        """Send periodic pings to check if client is alive."""
         while True:
             await asyncio.sleep(PING_INTERVAL)
 
@@ -684,16 +696,18 @@ class GameServer:
                 print(
                     f"Player {player.name} timed out (no pong for {time_since_pong:.1f}s)"
                 )
-                return  # Exit loop, which will trigger disconnect
+                connection_closed.set()
+                return
 
-            # WebRTC handles keepalive internally, but we can still send pings
+            # Send ping via data channel
             if player.webrtc_connected:
                 await self._send_to_player(player, MessageType.PING, b"")
             elif player.writer:
                 try:
                     await write_message(player.writer, MessageType.PING, b"")
                 except (ConnectionResetError, BrokenPipeError, OSError):
-                    return  # Connection dead
+                    connection_closed.set()
+                    return
 
     async def _handle_door_transition(
         self, player: Player, door_info: DoorInfo, seq: int
