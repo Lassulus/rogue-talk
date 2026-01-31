@@ -25,6 +25,8 @@ class TileDef:
     blocks_sound: bool | None = None  # None means use !walkable as default
     # If true, this tile is a door/teleporter (target defined in level.json)
     is_door: bool = False
+    # Optional: render using a different character than the map character
+    render_char: str | None = None
 
     def __post_init__(self) -> None:
         """Set default values for blocks_sight and blocks_sound based on walkable."""
@@ -58,6 +60,7 @@ def _load_tiles_from_json(
             blocks_sight=tile_data.get("blocks_sight"),
             blocks_sound=tile_data.get("blocks_sound"),
             is_door=tile_data.get("is_door", False),
+            render_char=tile_data.get("render_char"),
         )
 
     default_data = data["default"]
@@ -119,9 +122,12 @@ def render_tile(char: str, term: "Terminal", anim_frame: int = 0) -> str:
     else:
         color_name = tile.color
 
+    # Use render_char if specified, otherwise use the tile's char
+    display_char = tile.render_char if tile.render_char is not None else tile.char
+
     # Get the color function from terminal
     color_fn = getattr(term, color_name, None)
 
     if color_fn:
-        return str(color_fn(tile.char))
-    return tile.char
+        return str(color_fn(display_char))
+    return display_char

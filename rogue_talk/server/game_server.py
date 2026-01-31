@@ -166,6 +166,9 @@ class GameServer:
                 if tile_data.get("blocks_sound") is not None
                 else None,
                 is_door=bool(tile_data.get("is_door", False)),
+                render_char=str(tile_data["render_char"])
+                if tile_data.get("render_char")
+                else None,
             )
         return tiles
 
