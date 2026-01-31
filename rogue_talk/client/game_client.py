@@ -80,7 +80,8 @@ class GameClient:
         self._position_queue: asyncio.Queue[tuple[int, int, int]] | None = None
         # Client-side prediction: track pending (unacked) moves
         self._move_seq: int = 0
-        self._pending_moves: dict[int, tuple[int, int]] = {}  # seq -> (dx, dy)
+        # seq -> (dx, dy, expected_x, expected_y)
+        self._pending_moves: dict[int, tuple[int, int, int, int]] = {}
         # Temporary directory for level pack extraction
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         # Tile sound system
@@ -291,16 +292,28 @@ class GameClient:
 
         elif msg_type == MessageType.POSITION_ACK:
             seq, server_x, server_y = deserialize_position_ack(payload)
+            # Check if this move was rejected (position doesn't match expected)
+            acked_move = self._pending_moves.get(seq)
+            move_rejected = False
+            if acked_move:
+                _, _, expected_x, expected_y = acked_move
+                if server_x != expected_x or server_y != expected_y:
+                    move_rejected = True
             # Remove this move and all older moves from pending
             seqs_to_remove = [s for s in self._pending_moves if s <= seq]
             for s in seqs_to_remove:
                 del self._pending_moves[s]
-            # Reconcile: replay pending moves from server position
+            # If move was rejected, clear all pending moves - they were sent with
+            # wrong absolute positions and will also be rejected
+            if move_rejected:
+                self._pending_moves.clear()
+            # Set position from server
             self.x = server_x
             self.y = server_y
-            if self._pending_moves and self.level:
+            # Replay remaining pending moves (only if not rejected)
+            if self._pending_moves and self.level and not move_rejected:
                 for move_seq in sorted(self._pending_moves.keys()):
-                    dx, dy = self._pending_moves[move_seq]
+                    dx, dy, _, _ = self._pending_moves[move_seq]
                     new_x = self.x + dx
                     new_y = self.y + dy
                     if self.level.is_walkable(new_x, new_y):
@@ -530,7 +543,7 @@ class GameClient:
             if self.level.is_walkable(new_x, new_y):
                 self._move_seq += 1
                 seq = self._move_seq
-                self._pending_moves[seq] = (dx, dy)
+                self._pending_moves[seq] = (dx, dy, new_x, new_y)
                 self.x = new_x
                 self.y = new_y
                 # Queue position update (non-blocking)
