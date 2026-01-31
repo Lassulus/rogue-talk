@@ -6,6 +6,7 @@ import asyncio
 import socket
 import struct
 import tempfile
+import time
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -70,6 +71,8 @@ class GameClient:
         self.reader: StreamReader | None = None
         self.writer: StreamWriter | None = None
         self.running = False
+        self._needs_render = True  # Flag to track when re-render is needed
+        self._last_render_time = 0.0  # For periodic updates (mic level, animations)
         self.term: Any = Terminal()
         self.ui = TerminalUI(self.term)
         self.audio_capture: AudioCapture | None = None
@@ -223,19 +226,21 @@ class GameClient:
                 self._render()
                 while self.running:
                     # Drain all pending input (process buffered keys immediately)
-                    had_input = False
                     while True:
                         key = self.term.inkey(timeout=0)
                         if not key:
                             break
-                        had_input = True
                         await self._handle_input(key)
 
-                    # Render every frame (state may have changed from network)
-                    self._render()
+                    # Render when something changed or periodically for animations/mic
+                    now = time.monotonic()
+                    if self._needs_render or (now - self._last_render_time) > 0.25:
+                        self._render()
+                        self._needs_render = False
+                        self._last_render_time = now
 
-                    # Sleep to target ~60fps and let async tasks run
-                    await asyncio.sleep(0.016)
+                    # Sleep longer when idle to save CPU
+                    await asyncio.sleep(0.05)
         finally:
             self.running = False
             receiver_task.cancel()
@@ -293,7 +298,7 @@ class GameClient:
                         self.x = p.x
                         self.y = p.y
                         break
-            # Don't render here - let main loop handle it to avoid render storms
+            self._needs_render = True
 
         elif msg_type == MessageType.POSITION_ACK:
             seq, server_x, server_y = deserialize_position_ack(payload)
@@ -324,7 +329,7 @@ class GameClient:
                     if self.level.is_walkable(new_x, new_y):
                         self.x = new_x
                         self.y = new_y
-            # Don't render here - let main loop handle it to avoid render storms
+            self._needs_render = True
 
         elif msg_type == MessageType.PLAYER_JOINED:
             player_id, name = deserialize_player_joined(payload)
@@ -442,6 +447,7 @@ class GameClient:
 
         # Clear pending moves since we're in a new level
         self._pending_moves.clear()
+        self._needs_render = True
 
         # Parse and set doors for new level
         doors = parse_doors(level_pack.level_json_path)
@@ -537,6 +543,7 @@ class GameClient:
 
         if is_show_names_key(key):
             self.show_player_names = not self.show_player_names
+            self._needs_render = True
             return
 
         movement = get_movement(key)
@@ -551,6 +558,7 @@ class GameClient:
                 self._pending_moves[seq] = (dx, dy, new_x, new_y)
                 self.x = new_x
                 self.y = new_y
+                self._needs_render = True
                 # Queue position update (non-blocking)
                 self._position_queue.put_nowait((seq, new_x, new_y))
                 # Play walking sound for the new tile
@@ -559,6 +567,7 @@ class GameClient:
     async def _toggle_mute(self) -> None:
         """Toggle mute state."""
         self.is_muted = not self.is_muted
+        self._needs_render = True
         if self.writer:
             # Send without blocking - write directly
             payload = serialize_mute_status(self.is_muted)
