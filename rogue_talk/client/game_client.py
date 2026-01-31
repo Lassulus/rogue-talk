@@ -270,7 +270,12 @@ class GameClient:
             while self.running and self.reader:
                 msg_type, payload = await read_message(self.reader)
                 await self._handle_server_message(msg_type, payload)
-        except (asyncio.IncompleteReadError, ConnectionResetError):
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+        ):
             self.running = False
 
     async def _handle_server_message(

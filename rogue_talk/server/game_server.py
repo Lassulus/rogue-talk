@@ -391,6 +391,10 @@ class GameServer:
                 await self._broadcast_player_left(player.id)
                 print(f"Player {player.name} (id={player.id}) left")
                 writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _handle_level_pack_request(
         self, writer: StreamWriter, level_name: str
