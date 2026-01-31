@@ -1,9 +1,12 @@
 """Level pack extraction and handling."""
 
 import io
+import json
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from .level import DoorInfo
 
 
 @dataclass
@@ -13,6 +16,7 @@ class LevelPack:
     level_path: Path  # Path to level.txt
     tiles_path: Path | None  # Path to tiles.json (optional)
     assets_dir: Path | None  # Path to assets/ directory (optional)
+    level_json_path: Path | None  # Path to level.json (optional)
 
 
 def extract_level_pack(tarball_data: bytes, extract_dir: Path) -> LevelPack:
@@ -60,8 +64,45 @@ def extract_level_pack(tarball_data: bytes, extract_dir: Path) -> LevelPack:
         _assets_dir if _assets_dir.exists() and _assets_dir.is_dir() else None
     )
 
+    # Find level.json (optional)
+    _level_json_path = extract_dir / "level.json"
+    level_json_path: Path | None = (
+        _level_json_path if _level_json_path.exists() else None
+    )
+
     return LevelPack(
         level_path=level_path,
         tiles_path=tiles_path,
         assets_dir=assets_dir,
+        level_json_path=level_json_path,
     )
+
+
+def parse_doors(level_json_path: Path | None) -> list[DoorInfo]:
+    """Parse door definitions from level.json.
+
+    Args:
+        level_json_path: Path to level.json file, or None
+
+    Returns:
+        List of DoorInfo objects
+    """
+    if level_json_path is None or not level_json_path.exists():
+        return []
+
+    with open(level_json_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    doors: list[DoorInfo] = []
+    for door_data in data.get("doors", []):
+        door = DoorInfo(
+            x=door_data["x"],
+            y=door_data["y"],
+            target_level=door_data.get("target_level"),
+            target_x=door_data["target_x"],
+            target_y=door_data["target_y"],
+            see_through=door_data.get("see_through", False),
+        )
+        doors.append(door)
+
+    return doors

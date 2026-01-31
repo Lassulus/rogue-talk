@@ -9,12 +9,25 @@ from ..common import tiles as tile_defs
 
 
 @dataclass
+class DoorInfo:
+    """Information about a door/teleporter in a level."""
+
+    x: int
+    y: int
+    target_level: str | None  # None = same level teleporter
+    target_x: int
+    target_y: int
+    see_through: bool = False
+
+
+@dataclass
 class Level:
     """Client-side level representation."""
 
     width: int
     height: int
     tiles: list[list[str]]
+    doors: list[DoorInfo] | None = None
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Level:
@@ -42,3 +55,12 @@ class Level:
         if x < 0 or x >= self.width or y < 0 or y >= self.height:
             return False
         return tile_defs.is_walkable(self.tiles[y][x])
+
+    def get_see_through_door_at(self, x: int, y: int) -> DoorInfo | None:
+        """Get a see-through door at the given position, or None."""
+        if not self.doors:
+            return None
+        for door in self.doors:
+            if door.x == x and door.y == y and door.see_through:
+                return door
+        return None

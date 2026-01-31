@@ -41,8 +41,8 @@ from ..audio.sound_loader import SoundCache
 from ..common import tiles as tile_defs
 from .identity import Identity, load_or_create_identity
 from .input_handler import get_movement, is_mute_key, is_quit_key, is_show_names_key
-from .level import Level
-from .level_pack import extract_level_pack
+from .level import DoorInfo, Level
+from .level_pack import extract_level_pack, parse_doors
 from .terminal_ui import TerminalUI
 from .tile_sound_player import TileSoundPlayer
 
@@ -85,6 +85,8 @@ class GameClient:
         # Tile sound system
         self._sound_cache: SoundCache = SoundCache()
         self._tile_sound_player: TileSoundPlayer = TileSoundPlayer(self._sound_cache)
+        # Other levels loaded for see-through portals
+        self.other_levels: dict[str, Level] = {}
 
     async def connect(self) -> bool:
         """Connect to the server and complete handshake."""
@@ -132,6 +134,9 @@ class GameClient:
 
         # Set up sound assets directory
         self._sound_cache.set_assets_dir(level_pack.assets_dir)
+
+        # Parse doors from level.json
+        doors = parse_doors(level_pack.level_json_path)
 
         # Wait for AUTH_CHALLENGE
         msg_type, payload = await read_message(self.reader)
@@ -186,6 +191,11 @@ class GameClient:
             level_data,
         ) = deserialize_server_hello(payload)
         self.level = Level.from_bytes(level_data)
+        self.level.doors = doors
+
+        # Load other levels for see-through portals
+        await self._load_see_through_portal_levels()
+
         return True
 
     async def run(self) -> None:
@@ -394,6 +404,88 @@ class GameClient:
         # Clear pending moves since we're in a new level
         self._pending_moves.clear()
 
+        # Parse and set doors for new level
+        doors = parse_doors(level_pack.level_json_path)
+        self.level.doors = doors
+
+        # Load other levels for see-through portals
+        await self._load_see_through_portal_levels()
+
+    async def _load_see_through_portal_levels(self) -> None:
+        """Load other levels needed for see-through portals."""
+        if not self.level or not self.level.doors or not self.writer or not self.reader:
+            return
+
+        # Collect unique cross-level targets from see-through portals
+        target_levels: set[str] = set()
+        for door in self.level.doors:
+            if door.see_through and door.target_level:
+                target_levels.add(door.target_level)
+
+        # Load each target level
+        for target_level_name in target_levels:
+            if target_level_name in self.other_levels:
+                continue  # Already loaded
+
+            # Request the level pack
+            await write_message(
+                self.writer,
+                MessageType.LEVEL_PACK_REQUEST,
+                serialize_level_pack_request(target_level_name),
+            )
+
+            # Wait for LEVEL_PACK_DATA, handling other messages
+            while True:
+                msg_type, payload = await read_message(self.reader)
+                if msg_type == MessageType.LEVEL_PACK_DATA:
+                    break
+                # Handle other messages (but not door transitions to avoid recursion)
+                if msg_type != MessageType.DOOR_TRANSITION:
+                    await self._handle_server_message(msg_type, payload)
+
+            tarball_data = deserialize_level_pack_data(payload)
+            if not tarball_data:
+                continue
+
+            # Extract to a subdirectory for this level
+            if not self._temp_dir:
+                continue
+            extract_dir = Path(self._temp_dir.name) / f"other_{target_level_name}"
+
+            try:
+                level_pack = extract_level_pack(tarball_data, extract_dir)
+            except ValueError:
+                continue
+
+            # Load the level from the pack
+            with open(level_pack.level_path, encoding="utf-8") as f:
+                level_content = f.read()
+
+            lines = level_content.rstrip("\n").split("\n")
+            height = len(lines)
+            width = max(len(line) for line in lines) if lines else 0
+
+            tiles: list[list[str]] = []
+            for line in lines:
+                row: list[str] = []
+                for x in range(width):
+                    if x < len(line):
+                        char = line[x]
+                        if char == "S":
+                            char = "."
+                    else:
+                        char = " "
+                    row.append(char)
+                tiles.append(row)
+
+            other_level = Level(width=width, height=height, tiles=tiles)
+
+            # Parse doors for the other level too (for rendering tile chars)
+            other_doors = parse_doors(level_pack.level_json_path)
+            other_level.doors = other_doors
+
+            self.other_levels[target_level_name] = other_level
+
     async def _handle_input(self, key: Keystroke) -> None:
         """Handle keyboard input."""
         if is_quit_key(key):
@@ -458,6 +550,7 @@ class GameClient:
             self.is_muted,
             mic_level,
             self.show_player_names,
+            self.other_levels,
         )
 
     async def _start_audio(self) -> None:

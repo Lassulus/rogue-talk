@@ -7,7 +7,7 @@ from blessed import Terminal
 
 from ..common import tiles
 from ..common.protocol import PlayerInfo
-from .level import Level
+from .level import DoorInfo, Level
 from .viewport import Viewport
 
 # Lighting constants - gradual fade zones
@@ -135,6 +135,7 @@ class TerminalUI:
         is_muted: bool,
         mic_level: float = 0.0,
         show_player_names: bool = False,
+        other_levels: dict[str, Level] | None = None,
     ) -> None:
         """Render the game state to the terminal."""
         # Advance animation frame based on time (not render rate)
@@ -172,6 +173,7 @@ class TerminalUI:
                     player_x,
                     player_y,
                     show_player_names,
+                    other_levels or {},
                 )
                 row += char
             output.append(row + str(self.term.clear_eol))
@@ -227,6 +229,7 @@ class TerminalUI:
         player_x: int,
         player_y: int,
         show_player_names: bool = False,
+        other_levels: dict[str, Level] | None = None,
     ) -> str:
         """Get the character to display at a cell with distance-based lighting."""
         # Calculate distance from player
@@ -237,6 +240,16 @@ class TerminalUI:
         # Beyond visibility range - show empty
         if distance > LIGHT_FADING_RADIUS:
             return " "
+
+        # Check for see-through portal view before normal LOS check
+        portal_result = self._check_portal_view(
+            x, y, player_x, player_y, level, other_levels or {}
+        )
+        if portal_result:
+            portal_level, portal_x, portal_y, total_distance = portal_result
+            return self._render_tile_with_portal_tint(
+                portal_level.get_tile(portal_x, portal_y), total_distance, portal_x
+            )
 
         # Check line of sight - walls block light
         # The first wall hit IS visible (ray reaches it), but nothing behind it
@@ -351,6 +364,111 @@ class TerminalUI:
         else:
             # Fading - use dark gray (256-color: 239)
             return str(self.term.color(239)(tile_def.char))  # type: ignore
+
+    def _check_portal_view(
+        self,
+        target_x: int,
+        target_y: int,
+        player_x: int,
+        player_y: int,
+        level: Level,
+        other_levels: dict[str, Level],
+    ) -> tuple[Level, int, int, float] | None:
+        """Check if viewing through a see-through portal to see a target cell.
+
+        Traces line of sight from player to target. If a see-through portal is
+        encountered, returns the mapped position in the target level.
+
+        Returns:
+            Tuple of (target_level, mapped_x, mapped_y, total_distance) if viewing
+            through a portal, or None if not.
+        """
+        if not level.doors:
+            return None
+
+        # Same position - can't be through a portal
+        if target_x == player_x and target_y == player_y:
+            return None
+
+        # Trace line from player to target using Bresenham
+        dx = abs(target_x - player_x)
+        dy = abs(target_y - player_y)
+        sx = 1 if player_x < target_x else -1
+        sy = 1 if player_y < target_y else -1
+        err = dx - dy
+
+        x, y = player_x, player_y
+
+        while True:
+            # Move to next cell
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+
+            # Check if we've reached the target
+            if x == target_x and y == target_y:
+                return None  # Reached target without hitting a portal
+
+            # Check if this cell has a see-through portal
+            door = level.get_see_through_door_at(x, y)
+            if door:
+                # Calculate the offset from portal to target
+                offset_x = target_x - x
+                offset_y = target_y - y
+
+                # Map to target level position
+                mapped_x = door.target_x + offset_x
+                mapped_y = door.target_y + offset_y
+
+                # Get the target level
+                if door.target_level:
+                    # Cross-level portal
+                    target_level = other_levels.get(door.target_level)
+                    if not target_level:
+                        return None
+                else:
+                    # Same-level teleporter
+                    target_level = level
+
+                # Calculate total distance (player to portal + portal to mapped)
+                dist_to_portal = math.sqrt((x - player_x) ** 2 + (y - player_y) ** 2)
+                dist_from_portal = math.sqrt(offset_x**2 + offset_y**2)
+                total_distance = dist_to_portal + dist_from_portal
+
+                return (target_level, mapped_x, mapped_y, total_distance)
+
+            # Check if we hit a light-blocking tile (stop tracing)
+            tile = level.get_tile(x, y)
+            if tile in LIGHT_BLOCKING_TILES:
+                return None
+
+        return None
+
+    def _render_tile_with_portal_tint(
+        self, tile_char: str, distance: float, tile_x: int = 0
+    ) -> str:
+        """Render a tile seen through a portal with magenta tint."""
+        tile_def = tiles.get_tile(tile_char)
+        display_char = tile_def.render_char if tile_def.render_char else tile_def.char
+
+        # Apply distance-based magenta tinting
+        if distance <= LIGHT_FULL_RADIUS:
+            return str(self.term.bold_magenta(display_char))
+        elif distance <= LIGHT_NORMAL_RADIUS:
+            return str(self.term.magenta(display_char))
+        elif distance <= LIGHT_DIM_RADIUS:
+            # Dim magenta (256-color: 133)
+            return str(self.term.color(133)(display_char))  # type: ignore
+        elif distance <= LIGHT_DARKER_RADIUS:
+            # Darker magenta (256-color: 96)
+            return str(self.term.color(96)(display_char))  # type: ignore
+        else:
+            # Very dim magenta (256-color: 53)
+            return str(self.term.color(53)(display_char))  # type: ignore
 
     def cleanup(self) -> None:
         """Restore terminal state."""
