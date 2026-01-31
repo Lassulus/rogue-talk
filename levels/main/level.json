@@ -7,6 +7,14 @@
       "target_x": 47,
       "target_y": 9,
       "see_through": true
+    },
+    {
+      "x": 98,
+      "y": 3,
+      "target_level": "test",
+      "target_x": 9,
+      "target_y": 5,
+      "see_through": true
     }
   ]
 }

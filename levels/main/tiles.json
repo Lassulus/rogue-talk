@@ -122,6 +122,17 @@
       "blocks_sight": false,
       "blocks_sound": false,
       "is_door": true
+    },
+    "T": {
+      "name": "teleporter",
+      "color": "bold_magenta",
+      "walkable": true,
+      "walking_sound": null,
+      "nearby_sound": null,
+      "animation_colors": null,
+      "blocks_sight": false,
+      "blocks_sound": false,
+      "is_door": true
     }
   },
   "default": {

@@ -1,0 +1,54 @@
+{
+  "doors": [
+    {
+      "x": 9,
+      "y": 8,
+      "target_level": "main",
+      "target_x": 98,
+      "target_y": 3,
+      "see_through": true
+    },
+    {
+      "x": 2,
+      "y": 2,
+      "target_x": 17,
+      "target_y": 6,
+      "see_through": true
+    },
+    {
+      "x": 17,
+      "y": 2,
+      "target_x": 2,
+      "target_y": 6,
+      "see_through": true
+    },
+    {
+      "x": 2,
+      "y": 6,
+      "target_x": 17,
+      "target_y": 2,
+      "see_through": true
+    },
+    {
+      "x": 17,
+      "y": 6,
+      "target_x": 2,
+      "target_y": 2,
+      "see_through": true
+    },
+    {
+      "x": 7,
+      "y": 4,
+      "target_x": 10,
+      "target_y": 4,
+      "see_through": true
+    },
+    {
+      "x": 10,
+      "y": 4,
+      "target_x": 7,
+      "target_y": 4,
+      "see_through": true
+    }
+  ]
+}
