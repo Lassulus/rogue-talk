@@ -1,31 +1,38 @@
 """Main game server handling connections and game state."""
 
+from __future__ import annotations
+
 import asyncio
 import io
 import json
+import logging
 import os
+import struct
 import tarfile
 import time
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
+from typing import Any
 
-# Ping/keepalive settings
-PING_INTERVAL = 10.0  # Send ping every 10 seconds
-PING_TIMEOUT = 30.0  # Disconnect if no pong within 30 seconds
+from aiortc import RTCPeerConnection, RTCSessionDescription
 
+# Set up logging to see debug messages
+logger = logging.getLogger(__name__)
+
+from ..audio.webrtc_tracks import ServerAudioRelay, ServerOutboundTrack
+from ..common import tiles as tile_defs
 from ..common.crypto import verify_signature
 from ..common.protocol import (
-    AudioFrame,
     AuthResult,
     MessageType,
     PlayerInfo,
-    deserialize_audio_frame,
     deserialize_auth_response,
     deserialize_level_pack_request,
     deserialize_mute_status,
     deserialize_position_update,
+    deserialize_webrtc_ice,
+    deserialize_webrtc_offer,
     read_message,
-    serialize_audio_frame,
     serialize_auth_challenge,
     serialize_auth_result,
     serialize_door_transition,
@@ -34,15 +41,23 @@ from ..common.protocol import (
     serialize_player_left,
     serialize_position_ack,
     serialize_server_hello,
+    serialize_webrtc_answer,
     serialize_world_state,
     write_message,
 )
-from ..common import tiles as tile_defs
 from .audio_router import get_audio_recipients
 from .level import DoorInfo, Level
 from .player import Player
 from .storage import PlayerStorage
 from .world import World
+
+# Ping/keepalive settings
+PING_INTERVAL = 10.0  # Send ping every 10 seconds
+PING_TIMEOUT = 30.0  # Disconnect if no pong within 30 seconds
+
+# Audio routing interval (how often to route audio from all players)
+# Lower = less latency, higher = less CPU. 20ms is standard for voice.
+AUDIO_ROUTE_INTERVAL = 0.02  # 20ms
 
 
 class GameServer:
@@ -215,8 +230,57 @@ class GameServer:
         )
         addr = server.sockets[0].getsockname()
         print(f"Server listening on {addr[0]}:{addr[1]}")
-        async with server:
-            await server.serve_forever()
+
+        # Start audio routing task
+        audio_task = asyncio.create_task(self._audio_routing_loop())
+
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            audio_task.cancel()
+            try:
+                await audio_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _audio_routing_loop(self) -> None:
+        """Continuously route audio from all players to nearby recipients."""
+        while True:
+            await asyncio.sleep(AUDIO_ROUTE_INTERVAL)
+            await self._route_all_audio()
+
+    async def _route_all_audio(self) -> None:
+        """Route audio frames from all players to their recipients."""
+        for player in list(self.players.values()):
+            if not player.webrtc_connected or player.audio_relay is None:
+                continue
+            if player.is_muted:
+                continue
+
+            # Get recipients based on proximity (calculate once per player)
+            recipients = get_audio_recipients(player, self.players)
+            if not recipients:
+                # No recipients, drain queue to prevent buildup
+                while player.audio_relay.get_audio_frame() is not None:
+                    pass
+                continue
+
+            # Drain ALL available frames from this player
+            while True:
+                frame = player.audio_relay.get_audio_frame()
+                if frame is None:
+                    break
+
+                for recipient, volume in recipients:
+                    if (
+                        not recipient.webrtc_connected
+                        or recipient.outbound_audio is None
+                    ):
+                        continue
+                    # Scale audio by volume and send
+                    scaled_frame = frame * volume
+                    recipient.outbound_audio.send_audio(scaled_frame)
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter) -> None:
         player: Player | None = None
@@ -346,31 +410,154 @@ class GameServer:
                 ),
             )
 
-            # Notify others about new player
-            await self._broadcast_player_joined(player)
-
-            # Send initial world state
-            await self._send_world_state(player)
-
             returning = " (returning)" if saved_state else ""
             print(
                 f"Player {name} (id={player_id}) joined at ({spawn_x}, {spawn_y}){returning}"
             )
 
-            # Run message loop and ping task concurrently
-            message_task = asyncio.create_task(self._message_loop(player, reader))
-            ping_task = asyncio.create_task(self._ping_loop(player))
+            # Handle LEVEL_PACK_REQUEST(s) before WebRTC signaling
+            # The client requests level packs over TCP before setting up WebRTC
+            while True:
+                msg_type, payload = await read_message(reader)
+                if msg_type == MessageType.LEVEL_PACK_REQUEST:
+                    level_name = deserialize_level_pack_request(payload)
+                    await self._handle_level_pack_request(writer, level_name)
+                elif msg_type == MessageType.WEBRTC_OFFER:
+                    break
+                else:
+                    print(f"Unexpected message type during signaling: {msg_type}")
+                    # Continue waiting for expected messages
 
-            # Wait for either to finish (first one to finish cancels the other)
-            done, pending = await asyncio.wait(
-                [message_task, ping_task], return_when=asyncio.FIRST_COMPLETED
+            offer_sdp = deserialize_webrtc_offer(payload)
+
+            # Create peer connection for this player
+            pc = RTCPeerConnection()
+            player.peer_connection = pc
+
+            # Create outbound audio track for sending audio to this player
+            outbound_track = ServerOutboundTrack()
+            player.outbound_audio = outbound_track
+            pc.addTrack(outbound_track)
+
+            # Create audio relay for receiving audio from this player
+            audio_relay = ServerAudioRelay(player_id)
+            player.audio_relay = audio_relay
+
+            # Event: data channel opened by client
+            data_channel_ready = asyncio.Event()
+
+            @pc.on("datachannel")
+            def on_datachannel(channel: Any) -> None:
+                player.data_channel = channel
+
+                @channel.on("open")  # type: ignore[misc]
+                def on_open() -> None:
+                    data_channel_ready.set()
+
+                @channel.on("message")  # type: ignore[misc]
+                def on_message(message: bytes | str) -> None:
+                    if isinstance(message, str):
+                        message = message.encode("utf-8")
+                    asyncio.create_task(
+                        self._handle_data_channel_message(player, message)
+                    )
+
+                # Check if channel is already open (in case we missed the event)
+                if hasattr(channel, "readyState") and channel.readyState == "open":
+                    data_channel_ready.set()
+
+            # Event: incoming audio track
+            @pc.on("track")
+            def on_track(track: Any) -> None:
+                if track.kind == "audio":
+                    print(f"Audio track received from player {player.name}")
+                    audio_relay.set_track(track)
+                    asyncio.create_task(audio_relay.start_receiving())
+
+            # Handle connection state changes
+            connection_closed = asyncio.Event()
+
+            @pc.on("connectionstatechange")
+            async def on_connectionstatechange() -> None:
+                state = pc.connectionState
+                if state in ("failed", "closed", "disconnected"):
+                    connection_closed.set()
+                elif state == "connected":
+                    player.webrtc_connected = True
+
+            # Set remote description and create answer
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=offer_sdp, type="offer")
             )
-            for task in pending:
-                task.cancel()
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+
+            # Send WEBRTC_ANSWER
+            answer_sdp = pc.localDescription.sdp if pc.localDescription else ""
+            await write_message(
+                writer,
+                MessageType.WEBRTC_ANSWER,
+                serialize_webrtc_answer(answer_sdp),
+            )
+
+            # Handle ICE candidates from client (over TCP during signaling)
+            # Wait for data channel to be ready or connection to fail
+            signaling_done = False
+            while not signaling_done:
+                # Check if data channel is ready BEFORE trying to read
+                # (client may close TCP once WebRTC is established)
+                if data_channel_ready.is_set():
+                    signaling_done = True
+                    break
+                elif connection_closed.is_set():
+                    return
+
                 try:
-                    await task
-                except asyncio.CancelledError:
+                    msg_type, payload = await asyncio.wait_for(
+                        read_message(reader), timeout=0.1
+                    )
+                    if msg_type == MessageType.WEBRTC_ICE:
+                        sdp_mid, sdp_mline_idx, candidate = deserialize_webrtc_ice(
+                            payload
+                        )
+                        # Empty candidate signals end of ICE gathering
+                        if candidate:
+                            from aiortc import RTCIceCandidate
+
+                            # Parse ICE candidate string
+                            # aiortc expects specific attributes
+                            pass  # aiortc handles ICE internally for server-relay
+                except asyncio.TimeoutError:
                     pass
+                except asyncio.IncompleteReadError:
+                    # Client closed TCP - check if data channel is ready
+                    if data_channel_ready.is_set():
+                        signaling_done = True
+                        break
+                    else:
+                        # TCP closed before WebRTC was ready
+                        return
+
+            # Mark player as WebRTC connected (data channel is ready)
+            player.webrtc_connected = True
+
+            # Close TCP connection (signaling complete)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            player.reader = None
+            player.writer = None
+
+            # Notify others about new player (via data channel)
+            await self._broadcast_player_joined(player)
+
+            # Send initial world state (via data channel)
+            await self._send_world_state(player)
+
+            # Wait for WebRTC connection to close
+            await connection_closed.wait()
 
         except (
             asyncio.IncompleteReadError,
@@ -379,27 +566,85 @@ class GameServer:
             TimeoutError,
             OSError,
         ):
-            pass
+            pass  # Client disconnected
+        except Exception as e:
+            # Log unexpected exceptions
+            logger.error(
+                f"Unexpected error for {player.name if player else 'unknown'}: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
         finally:
             if player:
                 # Save player state before removing
                 self.storage.save_player_state(
                     player.name, player.x, player.y, player.current_level
                 )
+
+                # Stop audio relay
+                if player.audio_relay:
+                    await player.audio_relay.stop_receiving()
+
+                # Close peer connection
+                if player.peer_connection:
+                    await player.peer_connection.close()
+
                 async with self._lock:
                     self.players.pop(player.id, None)
                 await self._broadcast_player_left(player.id)
                 print(f"Player {player.name} (id={player.id}) left")
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
+
+                # Close TCP if still open
+                if player.writer:
+                    player.writer.close()
+                    try:
+                        await player.writer.wait_closed()
+                    except Exception:
+                        pass
+
+    async def _handle_data_channel_message(self, player: Player, data: bytes) -> None:
+        """Handle a message received via WebRTC data channel."""
+        if len(data) < 1:
+            return
+        msg_type = MessageType(data[0])
+        payload = data[1:]
+        await self._handle_message(player, msg_type, payload)
+
+    async def _send_to_player(
+        self, player: Player, msg_type: MessageType, payload: bytes
+    ) -> None:
+        """Send a message to a player via data channel."""
+        if not player.webrtc_connected or player.data_channel is None:
+            return
+        try:
+            # Prepend message type byte
+            message = bytes([msg_type]) + payload
+            player.data_channel.send(message)
+        except Exception:
+            pass
+
+    async def _handle_level_pack_request_dc(
+        self, player: Player, level_name: str
+    ) -> None:
+        """Handle a LEVEL_PACK_REQUEST message via data channel."""
+        if level_name in self.level_packs:
+            tarball = self.level_packs[level_name]
+            print(f"Sending level pack: {level_name} ({len(tarball)} bytes)")
+        else:
+            # Level not found - send empty response
+            tarball = b""
+            print(f"Level pack not found: {level_name}")
+
+        await self._send_to_player(
+            player,
+            MessageType.LEVEL_PACK_DATA,
+            serialize_level_pack_data(tarball),
+        )
 
     async def _handle_level_pack_request(
         self, writer: StreamWriter, level_name: str
     ) -> None:
-        """Handle a LEVEL_PACK_REQUEST message."""
+        """Handle a LEVEL_PACK_REQUEST message (legacy TCP, used during signaling)."""
         if level_name in self.level_packs:
             tarball = self.level_packs[level_name]
             print(f"Sending level pack: {level_name} ({len(tarball)} bytes)")
@@ -415,7 +660,7 @@ class GameServer:
         )
 
     async def _message_loop(self, player: Player, reader: StreamReader) -> None:
-        """Main message loop for a player."""
+        """Main message loop for a player (legacy TCP, not used with WebRTC)."""
         try:
             while True:
                 msg_type, payload = await read_message(reader)
@@ -429,7 +674,7 @@ class GameServer:
             pass  # Client disconnected
 
     async def _ping_loop(self, player: Player) -> None:
-        """Send periodic pings to check if client is alive."""
+        """Send periodic pings to check if client is alive (legacy TCP)."""
         while True:
             await asyncio.sleep(PING_INTERVAL)
 
@@ -441,11 +686,14 @@ class GameServer:
                 )
                 return  # Exit loop, which will trigger disconnect
 
-            # Send ping
-            try:
-                await write_message(player.writer, MessageType.PING, b"")
-            except (ConnectionResetError, BrokenPipeError, OSError):
-                return  # Connection dead
+            # WebRTC handles keepalive internally, but we can still send pings
+            if player.webrtc_connected:
+                await self._send_to_player(player, MessageType.PING, b"")
+            elif player.writer:
+                try:
+                    await write_message(player.writer, MessageType.PING, b"")
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    return  # Connection dead
 
     async def _handle_door_transition(
         self, player: Player, door_info: DoorInfo, seq: int
@@ -462,14 +710,11 @@ class GameServer:
         if not is_same_level and target_level_name not in self.levels:
             print(f"Door transition failed: level '{target_level_name}' not found")
             # Send ACK at current position (transition failed)
-            try:
-                await write_message(
-                    player.writer,
-                    MessageType.POSITION_ACK,
-                    serialize_position_ack(seq, player.x, player.y),
-                )
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            await self._send_to_player(
+                player,
+                MessageType.POSITION_ACK,
+                serialize_position_ack(seq, player.x, player.y),
+            )
             return
 
         if is_same_level:
@@ -479,14 +724,11 @@ class GameServer:
             player.y = target_y
 
             # Send position ACK with new position
-            try:
-                await write_message(
-                    player.writer,
-                    MessageType.POSITION_ACK,
-                    serialize_position_ack(seq, player.x, player.y),
-                )
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            await self._send_to_player(
+                player,
+                MessageType.POSITION_ACK,
+                serialize_position_ack(seq, player.x, player.y),
+            )
         else:
             # Door to different level
             print(
@@ -494,14 +736,11 @@ class GameServer:
             )
 
             # Send DOOR_TRANSITION message to client
-            try:
-                await write_message(
-                    player.writer,
-                    MessageType.DOOR_TRANSITION,
-                    serialize_door_transition(target_level_name, target_x, target_y),
-                )
-            except (ConnectionResetError, BrokenPipeError):
-                return
+            await self._send_to_player(
+                player,
+                MessageType.DOOR_TRANSITION,
+                serialize_door_transition(target_level_name, target_x, target_y),
+            )
 
             # Update player's level and position
             player.current_level = target_level_name
@@ -509,14 +748,11 @@ class GameServer:
             player.y = target_y
 
             # Send position ACK with new position
-            try:
-                await write_message(
-                    player.writer,
-                    MessageType.POSITION_ACK,
-                    serialize_position_ack(seq, player.x, player.y),
-                )
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            await self._send_to_player(
+                player,
+                MessageType.POSITION_ACK,
+                serialize_position_ack(seq, player.x, player.y),
+            )
 
         await self._broadcast_world_state()
 
@@ -552,25 +788,17 @@ class GameServer:
                                 return  # Door transition handles ACK differently
 
             # Always send ACK with authoritative position (even if move was rejected)
-            try:
-                await write_message(
-                    player.writer,
-                    MessageType.POSITION_ACK,
-                    serialize_position_ack(seq, player.x, player.y),
-                )
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            await self._send_to_player(
+                player,
+                MessageType.POSITION_ACK,
+                serialize_position_ack(seq, player.x, player.y),
+            )
             await self._broadcast_world_state()
 
         elif msg_type == MessageType.LEVEL_PACK_REQUEST:
             # Handle level pack requests during gameplay (for door transitions)
             level_name = deserialize_level_pack_request(payload)
-            await self._handle_level_pack_request(player.writer, level_name)
-
-        elif msg_type == MessageType.AUDIO_FRAME:
-            frame = deserialize_audio_frame(payload)
-            frame.player_id = player.id  # Ensure correct source
-            await self._route_audio(player, frame)
+            await self._handle_level_pack_request_dc(player, level_name)
 
         elif msg_type == MessageType.MUTE_STATUS:
             player.is_muted = deserialize_mute_status(payload)
@@ -579,67 +807,37 @@ class GameServer:
         elif msg_type == MessageType.PONG:
             player.last_pong_time = time.monotonic()
 
-    async def _route_audio(self, source: Player, frame: AudioFrame) -> None:
-        """Route audio frame to nearby players with volume scaling."""
-        recipients = get_audio_recipients(source, self.players)
-        for recipient, volume in recipients:
-            routed_frame = AudioFrame(
-                player_id=source.id,
-                timestamp_ms=frame.timestamp_ms,
-                volume=volume,
-                opus_data=frame.opus_data,
-            )
-            try:
-                await write_message(
-                    recipient.writer,
-                    MessageType.AUDIO_FRAME,
-                    serialize_audio_frame(routed_frame),
-                )
-            except (ConnectionResetError, BrokenPipeError):
-                pass
-
     async def _send_world_state(self, player: Player) -> None:
-        """Send current world state to a specific player."""
+        """Send current world state to a specific player via data channel."""
         players_info = [
             PlayerInfo(p.id, p.x, p.y, p.is_muted, p.name, p.current_level)
             for p in self.players.values()
         ]
-        await write_message(
-            player.writer,
+        await self._send_to_player(
+            player,
             MessageType.WORLD_STATE,
             serialize_world_state(players_info),
         )
 
     async def _broadcast_world_state(self) -> None:
-        """Broadcast world state to all players."""
+        """Broadcast world state to all players via data channels."""
         players_info = [
             PlayerInfo(p.id, p.x, p.y, p.is_muted, p.name, p.current_level)
             for p in self.players.values()
         ]
         payload = serialize_world_state(players_info)
         for player in list(self.players.values()):
-            try:
-                await write_message(player.writer, MessageType.WORLD_STATE, payload)
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            await self._send_to_player(player, MessageType.WORLD_STATE, payload)
 
     async def _broadcast_player_joined(self, new_player: Player) -> None:
-        """Notify all other players about a new player."""
+        """Notify all other players about a new player via data channels."""
         payload = serialize_player_joined(new_player.id, new_player.name)
         for player in list(self.players.values()):
             if player.id != new_player.id:
-                try:
-                    await write_message(
-                        player.writer, MessageType.PLAYER_JOINED, payload
-                    )
-                except (ConnectionResetError, BrokenPipeError):
-                    pass
+                await self._send_to_player(player, MessageType.PLAYER_JOINED, payload)
 
     async def _broadcast_player_left(self, player_id: int) -> None:
-        """Notify all players that someone left."""
+        """Notify all players that someone left via data channels."""
         payload = serialize_player_left(player_id)
         for player in list(self.players.values()):
-            try:
-                await write_message(player.writer, MessageType.PLAYER_LEFT, payload)
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            await self._send_to_player(player, MessageType.PLAYER_LEFT, payload)

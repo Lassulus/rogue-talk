@@ -14,10 +14,6 @@ class AudioPacket:
 class JitterBuffer:
     """Buffers audio packets to smooth out network jitter."""
 
-    # Gap threshold: if timestamp jumps by more than this, reset buffer
-    # This handles VAD silence gaps - treat as new speech burst
-    GAP_THRESHOLD_MS = 500
-
     def __init__(self, min_packets: int = 5, max_packets: int = 15):
         # Increased defaults for WiFi tolerance:
         # min_packets=5 (100ms) gives more buffer for jitter
@@ -26,18 +22,12 @@ class JitterBuffer:
         self.max_packets = max_packets
         self.packets: collections.deque[AudioPacket] = collections.deque()
         self.playback_started = False
-        self._last_timestamp_ms = 0
 
     def add_packet(self, packet: AudioPacket) -> None:
         """Add a packet, maintaining timestamp order."""
-        # Detect large timestamp gaps (e.g., from VAD silence)
-        # Reset buffer to re-sync playback
-        if self.playback_started and self.packets:
-            gap = packet.timestamp_ms - self._last_timestamp_ms
-            if gap > self.GAP_THRESHOLD_MS:
-                self.reset()
-
-        self._last_timestamp_ms = packet.timestamp_ms
+        # Note: We don't reset on timestamp gaps anymore - it caused stuttering
+        # by requiring min_packets to refill after every speech pause.
+        # The buffer handles gaps naturally by just playing what's available.
 
         if not self.packets or packet.timestamp_ms >= self.packets[-1].timestamp_ms:
             self.packets.append(packet)

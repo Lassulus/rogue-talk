@@ -1,4 +1,4 @@
-"""Microphone capture with Opus encoding."""
+"""Microphone capture for WebRTC audio track."""
 
 import time
 from collections.abc import Callable
@@ -8,24 +8,28 @@ import numpy as np
 import numpy.typing as npt
 import sounddevice as sd
 
-from ..audio.opus_codec import OpusEncoder
 from ..common.constants import CHANNELS, FRAME_SIZE, SAMPLE_RATE
 
 
 class AudioCapture:
-    """Captures audio from microphone and encodes to Opus."""
+    """Captures audio from microphone and sends raw PCM to WebRTC track.
 
-    # VAD settings
-    VAD_THRESHOLD = 0.02  # Minimum level to consider as speech
+    With WebRTC, the audio encoding (Opus) is handled by aiortc, so we just
+    pass raw PCM data to the callback.
+    """
+
+    # VAD settings (set threshold to 0 to disable VAD)
+    VAD_THRESHOLD = 0.0  # Disabled - WebRTC handles this
     VAD_HOLDOVER_FRAMES = 25  # Continue sending for 500ms after speech ends (25 * 20ms)
 
-    def __init__(self, on_frame: Callable[[bytes, int], None]) -> None:
+    def __init__(
+        self, on_frame: Callable[[npt.NDArray[np.float32], int], None]
+    ) -> None:
         """
         Args:
-            on_frame: Callback called with (opus_data, timestamp_ms) for each frame
+            on_frame: Callback called with (pcm_data, timestamp_ms) for each frame
         """
         self.on_frame = on_frame
-        self.encoder = OpusEncoder()
         self.stream: sd.InputStream | None = None
         self.is_muted = False
         self._start_time_ms = 0
@@ -85,11 +89,8 @@ class AudioCapture:
             # Silence and holdover expired - skip frame
             return
 
-        # Encode to Opus
-        opus_data = self.encoder.encode(pcm)
-
         # Calculate timestamp
         timestamp_ms = int(time.time() * 1000) - self._start_time_ms
 
-        # Send to callback
-        self.on_frame(opus_data, timestamp_ms)
+        # Send raw PCM to callback (WebRTC track handles encoding)
+        self.on_frame(pcm, timestamp_ms)

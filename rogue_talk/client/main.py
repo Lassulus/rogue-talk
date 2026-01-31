@@ -10,15 +10,17 @@ from .game_client import GameClient
 
 
 def setup_logging(log_file: str) -> None:
-    """Configure logging to file and console."""
+    """Configure logging to file only (console would interfere with TUI)."""
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.FileHandler(log_file),
-            logging.StreamHandler(),
         ],
     )
+    # Suppress noisy aiortc debug logs (RTP packet spam)
+    logging.getLogger("aiortc").setLevel(logging.WARNING)
+    logging.getLogger("aioice").setLevel(logging.WARNING)
 
 
 def main() -> None:

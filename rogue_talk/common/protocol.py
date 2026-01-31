@@ -24,6 +24,10 @@ class MessageType(enum.IntEnum):
     AUTH_RESULT = 0x22  # Server -> Client: success/error code
     PING = 0x30  # Server -> Client: keepalive ping
     PONG = 0x31  # Client -> Server: keepalive pong
+    # WebRTC signaling messages (used over initial TCP for handshake)
+    WEBRTC_OFFER = 0x40  # Client -> Server: SDP offer
+    WEBRTC_ANSWER = 0x41  # Server -> Client: SDP answer
+    WEBRTC_ICE = 0x42  # Bidirectional: ICE candidate exchange
 
 
 @dataclass
@@ -292,3 +296,56 @@ def serialize_auth_result(result: AuthResult) -> bytes:
 
 def deserialize_auth_result(data: bytes) -> AuthResult:
     return AuthResult(struct.unpack("B", data[:1])[0])
+
+
+# WEBRTC_OFFER: SDP string (UTF-8 encoded, length-prefixed)
+def serialize_webrtc_offer(sdp: str) -> bytes:
+    sdp_bytes = sdp.encode("utf-8")
+    return struct.pack(">I", len(sdp_bytes)) + sdp_bytes
+
+
+def deserialize_webrtc_offer(data: bytes) -> str:
+    sdp_len = struct.unpack(">I", data[:4])[0]
+    return data[4 : 4 + sdp_len].decode("utf-8")
+
+
+# WEBRTC_ANSWER: SDP string (UTF-8 encoded, length-prefixed)
+def serialize_webrtc_answer(sdp: str) -> bytes:
+    sdp_bytes = sdp.encode("utf-8")
+    return struct.pack(">I", len(sdp_bytes)) + sdp_bytes
+
+
+def deserialize_webrtc_answer(data: bytes) -> str:
+    sdp_len = struct.unpack(">I", data[:4])[0]
+    return data[4 : 4 + sdp_len].decode("utf-8")
+
+
+# WEBRTC_ICE: ICE candidate (sdpMid, sdpMLineIndex, candidate string)
+def serialize_webrtc_ice(
+    sdp_mid: str | None, sdp_mline_index: int | None, candidate: str
+) -> bytes:
+    # Handle None values
+    mid_bytes = (sdp_mid or "").encode("utf-8")
+    idx = sdp_mline_index if sdp_mline_index is not None else 0
+    cand_bytes = candidate.encode("utf-8")
+    return (
+        struct.pack(">H", len(mid_bytes))
+        + mid_bytes
+        + struct.pack(">H", idx)
+        + struct.pack(">I", len(cand_bytes))
+        + cand_bytes
+    )
+
+
+def deserialize_webrtc_ice(data: bytes) -> tuple[str | None, int | None, str]:
+    offset = 0
+    mid_len = struct.unpack(">H", data[offset : offset + 2])[0]
+    offset += 2
+    sdp_mid = data[offset : offset + mid_len].decode("utf-8") if mid_len > 0 else None
+    offset += mid_len
+    sdp_mline_index = struct.unpack(">H", data[offset : offset + 2])[0]
+    offset += 2
+    cand_len = struct.unpack(">I", data[offset : offset + 4])[0]
+    offset += 4
+    candidate = data[offset : offset + cand_len].decode("utf-8")
+    return sdp_mid, sdp_mline_index, candidate

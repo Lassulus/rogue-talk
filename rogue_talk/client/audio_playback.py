@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
@@ -15,11 +17,20 @@ from ..common.constants import CHANNELS, FRAME_SIZE, SAMPLE_RATE
 from .jitter_buffer import AudioPacket, JitterBuffer
 
 if TYPE_CHECKING:
+    from ..audio.webrtc_tracks import AudioPlaybackTrack
     from .tile_sound_player import TileSoundPlayer
+
+_logger = logging.getLogger(__name__)
 
 
 class AudioPlayback:
     """Manages receiving, decoding, and playing back audio from multiple players."""
+
+    # Jitter buffer settings for WebRTC
+    # Wait for this many samples before starting playback (100ms = 4800 samples)
+    WEBRTC_MIN_BUFFER = FRAME_SIZE * 5  # 100ms
+    # Maximum buffer size before discarding old data (300ms = 14400 samples)
+    WEBRTC_MAX_BUFFER = FRAME_SIZE * 15  # 300ms
 
     def __init__(self) -> None:
         self.jitter_buffers: dict[int, JitterBuffer] = defaultdict(JitterBuffer)
@@ -27,6 +38,18 @@ class AudioPlayback:
         self.mixer = AudioMixer()
         self.stream: sd.OutputStream | None = None
         self.tile_sound_player: TileSoundPlayer | None = None
+        # WebRTC audio track for receiving voice
+        self.webrtc_track: AudioPlaybackTrack | None = None
+        # Buffer for WebRTC audio samples (numpy array for efficiency)
+        self._webrtc_sample_buffer: npt.NDArray[np.float32] = np.array(
+            [], dtype=np.float32
+        )
+        # Track if WebRTC playback has started (for jitter buffering)
+        self._webrtc_playback_started = False
+        # Diagnostics
+        self._underrun_count: dict[int, int] = defaultdict(int)
+        self._frame_count: dict[int, int] = defaultdict(int)
+        self._last_log_time = 0.0
 
     def start(self) -> None:
         """Start audio output stream."""
@@ -77,7 +100,51 @@ class AudioPlayback:
         status: sd.CallbackFlags,
     ) -> None:
         """Sounddevice callback - runs in separate thread."""
-        # Process each player's jitter buffer
+        # Process WebRTC audio track (voice from server)
+        # Get exactly FRAME_SIZE samples for this callback
+        webrtc_frame: npt.NDArray[np.float32] | None = None
+
+        if self.webrtc_track is not None:
+            # Drain all available frames from WebRTC track into buffer
+            while True:
+                frame_data = self.webrtc_track.get_frame()
+                if frame_data is None:
+                    break
+                pcm_data, volume = frame_data
+                # Flatten to 1D and apply volume
+                samples = pcm_data.flatten() * volume
+                # Append to buffer
+                self._webrtc_sample_buffer = np.concatenate(
+                    [self._webrtc_sample_buffer, samples.astype(np.float32)]
+                )
+
+            buffer_len = len(self._webrtc_sample_buffer)
+
+            # Jitter buffering: wait for minimum buffer before starting playback
+            if not self._webrtc_playback_started:
+                if buffer_len >= self.WEBRTC_MIN_BUFFER:
+                    self._webrtc_playback_started = True
+                # Don't output anything until we have enough buffer
+
+            # Extract exactly FRAME_SIZE samples for this callback
+            if self._webrtc_playback_started and buffer_len >= FRAME_SIZE:
+                webrtc_frame = self._webrtc_sample_buffer[:FRAME_SIZE]
+                self._webrtc_sample_buffer = self._webrtc_sample_buffer[FRAME_SIZE:]
+
+                # Prevent buffer from growing too large (discard old data)
+                if len(self._webrtc_sample_buffer) > self.WEBRTC_MAX_BUFFER:
+                    # Keep only the most recent data
+                    self._webrtc_sample_buffer = self._webrtc_sample_buffer[
+                        -self.WEBRTC_MAX_BUFFER :
+                    ]
+            elif self._webrtc_playback_started and buffer_len < FRAME_SIZE:
+                # Buffer underrun - reset playback state to rebuffer
+                self._webrtc_playback_started = False
+
+        if webrtc_frame is not None:
+            self.mixer.add_frame(0, webrtc_frame, 1.0)
+
+        # Process each player's jitter buffer (legacy TCP path, not used with WebRTC)
         for player_id, jitter_buffer in list(self.jitter_buffers.items()):
             packet = jitter_buffer.get_next_packet()
             if packet is not None:
@@ -87,6 +154,10 @@ class AudioPlayback:
 
                 # Add to mixer with volume
                 self.mixer.add_frame(player_id, pcm, packet.volume)
+                self._frame_count[player_id] += 1
+            elif jitter_buffer.has_started():
+                # Underrun: buffer empty after playback started
+                self._underrun_count[player_id] += 1
 
         # Mix all voice streams
         mixed = self.mixer.mix()

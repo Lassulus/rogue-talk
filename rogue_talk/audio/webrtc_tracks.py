@@ -1,0 +1,306 @@
+"""WebRTC audio track implementations for aiortc."""
+
+from __future__ import annotations
+
+import asyncio
+import fractions
+import logging
+import queue
+import time
+from typing import Any
+
+import numpy as np
+import numpy.typing as npt
+from aiortc import MediaStreamTrack
+
+from ..common.constants import CHANNELS, FRAME_SIZE, SAMPLE_RATE
+
+logger = logging.getLogger(__name__)
+
+# Import av for AudioFrame creation
+try:
+    import av
+except ImportError:
+    av = None  # type: ignore[assignment]
+
+
+class AudioCaptureTrack(MediaStreamTrack):
+    """Custom audio track that captures from microphone via sounddevice."""
+
+    kind = "audio"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: asyncio.Queue[npt.NDArray[np.float32]] = asyncio.Queue(maxsize=50)
+        self._start_time: float | None = None
+        self._timestamp = 0
+        self._sample_rate = SAMPLE_RATE
+        self._frame_size = FRAME_SIZE
+        # Track audio level for UI
+        self.last_level: float = 0.0
+
+    def feed_audio(self, pcm_data: npt.NDArray[np.float32]) -> None:
+        """Feed audio data from the capture callback (thread-safe)."""
+        # Update audio level
+        self.last_level = float(np.abs(pcm_data).max())
+        try:
+            self._queue.put_nowait(pcm_data.copy())
+        except asyncio.QueueFull:
+            pass  # Drop frame if queue is full
+
+    async def recv(self) -> Any:
+        """Called by aiortc to get the next audio frame."""
+        try:
+            if av is None:
+                raise RuntimeError("PyAV not available")
+
+            if self._start_time is None:
+                self._start_time = time.time()
+
+            try:
+                # Wait for audio data with timeout
+                pcm_data = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                # Generate silence if no data
+                pcm_data = np.zeros(self._frame_size, dtype=np.float32)
+            except asyncio.CancelledError:
+                raise
+
+            # Convert to int16 for av.AudioFrame (mono packed format)
+            # Use little-endian explicitly to match av.AudioFormat s16
+            pcm_int16 = np.clip(pcm_data * 32768, -32768, 32767).astype("<i2")
+
+            # Create AudioFrame with manual plane update (most reliable method)
+            frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm_int16))
+            frame.sample_rate = self._sample_rate
+            frame.pts = self._timestamp
+            frame.time_base = fractions.Fraction(1, self._sample_rate)
+            frame.planes[0].update(pcm_int16.tobytes())
+
+            self._timestamp += len(pcm_int16)
+            return frame
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"AudioCaptureTrack.recv() error: {type(e).__name__}: {e}")
+            raise
+
+
+class AudioPlaybackTrack:
+    """Receives audio from a WebRTC track and provides it for playback."""
+
+    def __init__(self) -> None:
+        # Use thread-safe queue since sounddevice callback runs in separate thread
+        self._queue: queue.Queue[tuple[npt.NDArray[np.float32], float]] = queue.Queue(
+            maxsize=50
+        )
+        self._running = False
+        self._task: asyncio.Task[None] | None = None
+        self._track: MediaStreamTrack | None = None
+        self._volume: float = 1.0
+
+    def set_track(self, track: MediaStreamTrack) -> None:
+        """Set the WebRTC track to receive audio from."""
+        self._track = track
+
+    def set_volume(self, volume: float) -> None:
+        """Set the volume scaling for this track."""
+        self._volume = volume
+
+    async def start(self) -> None:
+        """Start receiving audio from the track."""
+        if self._track is None:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._receive_loop())
+
+    async def stop(self) -> None:
+        """Stop receiving audio."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _receive_loop(self) -> None:
+        """Continuously receive frames from the WebRTC track."""
+        if self._track is None:
+            return
+
+        while self._running:
+            try:
+                frame = await self._track.recv()
+                if hasattr(frame, "to_ndarray"):
+                    # Convert av.AudioFrame to numpy array
+                    pcm_data = frame.to_ndarray()
+
+                    # Convert to float32 and normalize
+                    if pcm_data.dtype == np.int16:
+                        pcm_float = pcm_data.astype(np.float32) / 32768.0
+                    elif pcm_data.dtype == np.int32:
+                        pcm_float = pcm_data.astype(np.float32) / 2147483648.0
+                    else:
+                        pcm_float = pcm_data.astype(np.float32)
+
+                    # Flatten to 1D first
+                    pcm_float = pcm_float.flatten()
+
+                    # Check if this is interleaved stereo (layout=stereo but data is flat)
+                    # In that case, samples are [L0, R0, L1, R1, ...] - take left channel
+                    layout_name = getattr(
+                        getattr(frame, "layout", None), "name", "mono"
+                    )
+                    if layout_name == "stereo" and len(pcm_float) > 0:
+                        # Take every other sample (left channel only)
+                        pcm_float = pcm_float[::2]
+
+                    try:
+                        self._queue.put_nowait((pcm_float, self._volume))
+                    except queue.Full:
+                        pass
+            except Exception:
+                break
+
+    def get_frame(self) -> tuple[npt.NDArray[np.float32], float] | None:
+        """Get the next audio frame if available (thread-safe)."""
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+
+class ServerAudioRelay:
+    """Server-side audio relay that receives from one client and can send to others."""
+
+    def __init__(self, player_id: int) -> None:
+        self.player_id = player_id
+        self._incoming_queue: asyncio.Queue[npt.NDArray[np.float32]] = asyncio.Queue(
+            maxsize=50
+        )
+        self._track: MediaStreamTrack | None = None
+        self._running = False
+        self._receive_task: asyncio.Task[None] | None = None
+
+    def set_track(self, track: MediaStreamTrack) -> None:
+        """Set the incoming audio track from this player."""
+        self._track = track
+
+    async def start_receiving(self) -> None:
+        """Start receiving audio frames from the player's track."""
+        if self._track is None:
+            return
+        self._running = True
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def stop_receiving(self) -> None:
+        """Stop receiving audio."""
+        self._running = False
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _receive_loop(self) -> None:
+        """Receive frames from the WebRTC track."""
+        if self._track is None:
+            return
+
+        while self._running:
+            try:
+                frame = await self._track.recv()
+                if hasattr(frame, "to_ndarray"):
+                    pcm_data = frame.to_ndarray()
+
+                    # Convert to float32 and normalize
+                    if pcm_data.dtype == np.int16:
+                        pcm_float = pcm_data.astype(np.float32) / 32768.0
+                    elif pcm_data.dtype == np.int32:
+                        pcm_float = pcm_data.astype(np.float32) / 2147483648.0
+                    else:
+                        pcm_float = pcm_data.astype(np.float32)
+
+                    # Flatten to 1D first
+                    pcm_float = pcm_float.flatten()
+
+                    # Check if this is interleaved stereo (layout=stereo but data is flat)
+                    # In that case, samples are [L0, R0, L1, R1, ...] - take left channel
+                    layout_name = getattr(
+                        getattr(frame, "layout", None), "name", "mono"
+                    )
+                    if layout_name == "stereo" and len(pcm_float) > 0:
+                        # Take every other sample (left channel only)
+                        pcm_float = pcm_float[::2]
+
+                    try:
+                        self._incoming_queue.put_nowait(pcm_float)
+                    except asyncio.QueueFull:
+                        pass
+            except Exception:
+                break
+
+    def get_audio_frame(self) -> npt.NDArray[np.float32] | None:
+        """Get the latest audio frame from this player."""
+        try:
+            return self._incoming_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+
+class ServerOutboundTrack(MediaStreamTrack):
+    """Server-side track that sends mixed/routed audio to a client."""
+
+    kind = "audio"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: asyncio.Queue[npt.NDArray[np.float32]] = asyncio.Queue(maxsize=50)
+        self._timestamp = 0
+        self._sample_rate = SAMPLE_RATE
+        self._frame_count = 0
+
+    def send_audio(self, pcm_data: npt.NDArray[np.float32]) -> None:
+        """Queue audio data to send to the client."""
+        try:
+            self._queue.put_nowait(pcm_data.copy())
+        except asyncio.QueueFull:
+            pass
+
+    async def recv(self) -> Any:
+        """Called by aiortc to get the next audio frame to send."""
+        try:
+            if av is None:
+                raise RuntimeError("PyAV not available")
+
+            try:
+                # Wait longer for audio data since routing runs every 20ms
+                pcm_data = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                # Generate silence if no data
+                pcm_data = np.zeros(FRAME_SIZE, dtype=np.float32)
+            except asyncio.CancelledError:
+                # Task was cancelled, re-raise to stop the track
+                raise
+
+            # Convert to int16 for av.AudioFrame (mono packed format)
+            # Use little-endian explicitly to match av.AudioFormat s16
+            pcm_int16 = np.clip(pcm_data * 32768, -32768, 32767).astype("<i2")
+
+            # Create AudioFrame with manual plane update (most reliable method)
+            frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm_int16))
+            frame.sample_rate = self._sample_rate
+            frame.pts = self._timestamp
+            frame.time_base = fractions.Fraction(1, self._sample_rate)
+            frame.planes[0].update(pcm_int16.tobytes())
+
+            self._timestamp += len(pcm_int16)
+            self._frame_count += 1
+            return frame
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"ServerOutboundTrack.recv() error: {type(e).__name__}: {e}")
+            raise
