@@ -412,9 +412,17 @@ class GameServer:
 
     async def _message_loop(self, player: Player, reader: StreamReader) -> None:
         """Main message loop for a player."""
-        while True:
-            msg_type, payload = await read_message(reader)
-            await self._handle_message(player, msg_type, payload)
+        try:
+            while True:
+                msg_type, payload = await read_message(reader)
+                await self._handle_message(player, msg_type, payload)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+        ):
+            pass  # Client disconnected
 
     async def _ping_loop(self, player: Player) -> None:
         """Send periodic pings to check if client is alive."""
