@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -27,6 +28,8 @@ from ..common.protocol import (
     MessageType,
     PlayerInfo,
     deserialize_auth_response,
+    deserialize_level_files_request,
+    deserialize_level_manifest_request,
     deserialize_level_pack_request,
     deserialize_mute_status,
     deserialize_position_update,
@@ -36,6 +39,8 @@ from ..common.protocol import (
     serialize_auth_challenge,
     serialize_auth_result,
     serialize_door_transition,
+    serialize_level_files_data,
+    serialize_level_manifest,
     serialize_level_pack_data,
     serialize_player_joined,
     serialize_player_left,
@@ -78,6 +83,9 @@ class GameServer:
         self.level_tiles: dict[
             str, dict[str, tile_defs.TileDef]
         ] = {}  # name -> tile definitions
+        # Content-addressed caching: manifest and raw file contents per level
+        self.level_manifests: dict[str, dict[str, tuple[str, int]]] = {}
+        self.level_file_contents: dict[str, dict[str, bytes]] = {}
         self._load_level_packs()
         # Load "main" level for the world (for backwards compatibility)
         self.level = self.levels["main"]
@@ -97,14 +105,20 @@ class GameServer:
             name = folder_path.name
             self.level_packs[name] = self._create_tarball_from_folder(folder_path)
 
+            # Compute manifest and store file contents for caching
+            manifest, contents = self._compute_level_manifest(name, folder_path)
+            self.level_manifests[name] = manifest
+            self.level_file_contents[name] = contents
+
             # Parse the level and its tiles
             level, tiles = self._parse_level_pack(name)
             self.levels[name] = level
             self.level_tiles[name] = tiles
             # Count door tiles
             door_count = sum(1 for t in tiles.values() if t.is_door)
+            total_size = sum(size for _, size in manifest.values())
             print(
-                f"Loaded level pack: {name} ({level.width}x{level.height}, {door_count} door tiles)"
+                f"Loaded level pack: {name} ({level.width}x{level.height}, {door_count} door tiles, {len(manifest)} files, {total_size // 1024}KB)"
             )
 
         if "main" not in self.level_packs:
@@ -121,6 +135,21 @@ class GameServer:
                     arcname = file_path.relative_to(folder_path)
                     tar.add(file_path, arcname=str(arcname))
         return buffer.getvalue()
+
+    def _compute_level_manifest(
+        self, level_name: str, folder_path: Path
+    ) -> tuple[dict[str, tuple[str, int]], dict[str, bytes]]:
+        """Compute SHA256 hash and size for each file in level, return manifest and contents."""
+        manifest: dict[str, tuple[str, int]] = {}
+        contents: dict[str, bytes] = {}
+        for file_path in folder_path.rglob("*"):
+            if file_path.is_file():
+                content = file_path.read_bytes()
+                hash_hex = hashlib.sha256(content).hexdigest()
+                rel_path = str(file_path.relative_to(folder_path))
+                manifest[rel_path] = (hash_hex, len(content))
+                contents[rel_path] = content
+        return manifest, contents
 
     def _parse_level_pack(
         self, name: str
@@ -415,13 +444,21 @@ class GameServer:
                 f"Player {name} (id={player_id}) joined at ({spawn_x}, {spawn_y}){returning}"
             )
 
-            # Handle LEVEL_PACK_REQUEST(s) before WebRTC signaling
-            # The client requests level packs over TCP before setting up WebRTC
+            # Handle level requests before WebRTC signaling
+            # The client requests level data over TCP before setting up WebRTC
             while True:
                 msg_type, payload = await read_message(reader)
                 if msg_type == MessageType.LEVEL_PACK_REQUEST:
                     level_name = deserialize_level_pack_request(payload)
                     await self._handle_level_pack_request(writer, level_name)
+                elif msg_type == MessageType.LEVEL_MANIFEST_REQUEST:
+                    level_name = deserialize_level_manifest_request(payload)
+                    await self._handle_level_manifest_request(writer, level_name)
+                elif msg_type == MessageType.LEVEL_FILES_REQUEST:
+                    level_name, filenames = deserialize_level_files_request(payload)
+                    await self._handle_level_files_request(
+                        writer, level_name, filenames
+                    )
                 elif msg_type == MessageType.WEBRTC_OFFER:
                     break
                 else:
@@ -669,6 +706,78 @@ class GameServer:
             serialize_level_pack_data(tarball),
         )
 
+    async def _handle_level_manifest_request(
+        self, writer: StreamWriter, level_name: str
+    ) -> None:
+        """Handle a LEVEL_MANIFEST_REQUEST message (TCP, used during signaling)."""
+        if level_name in self.level_manifests:
+            manifest = self.level_manifests[level_name]
+            print(f"Sending manifest: {level_name} ({len(manifest)} files)")
+        else:
+            manifest = {}
+            print(f"Level manifest not found: {level_name}")
+
+        await write_message(
+            writer,
+            MessageType.LEVEL_MANIFEST,
+            serialize_level_manifest(manifest),
+        )
+
+    async def _handle_level_manifest_request_dc(
+        self, player: Player, level_name: str
+    ) -> None:
+        """Handle a LEVEL_MANIFEST_REQUEST message via data channel."""
+        if level_name in self.level_manifests:
+            manifest = self.level_manifests[level_name]
+            print(f"Sending manifest: {level_name} ({len(manifest)} files)")
+        else:
+            manifest = {}
+            print(f"Level manifest not found: {level_name}")
+
+        await self._send_to_player(
+            player,
+            MessageType.LEVEL_MANIFEST,
+            serialize_level_manifest(manifest),
+        )
+
+    async def _handle_level_files_request(
+        self, writer: StreamWriter, level_name: str, filenames: list[str]
+    ) -> None:
+        """Handle a LEVEL_FILES_REQUEST message (TCP, used during signaling)."""
+        files: dict[str, bytes] = {}
+        if level_name in self.level_file_contents:
+            level_contents = self.level_file_contents[level_name]
+            for filename in filenames:
+                if filename in level_contents:
+                    files[filename] = level_contents[filename]
+        total_size = sum(len(c) for c in files.values())
+        print(f"Sending {len(files)} files for {level_name} ({total_size} bytes)")
+
+        await write_message(
+            writer,
+            MessageType.LEVEL_FILES_DATA,
+            serialize_level_files_data(files),
+        )
+
+    async def _handle_level_files_request_dc(
+        self, player: Player, level_name: str, filenames: list[str]
+    ) -> None:
+        """Handle a LEVEL_FILES_REQUEST message via data channel."""
+        files: dict[str, bytes] = {}
+        if level_name in self.level_file_contents:
+            level_contents = self.level_file_contents[level_name]
+            for filename in filenames:
+                if filename in level_contents:
+                    files[filename] = level_contents[filename]
+        total_size = sum(len(c) for c in files.values())
+        print(f"Sending {len(files)} files for {level_name} ({total_size} bytes)")
+
+        await self._send_to_player(
+            player,
+            MessageType.LEVEL_FILES_DATA,
+            serialize_level_files_data(files),
+        )
+
     async def _message_loop(self, player: Player, reader: StreamReader) -> None:
         """Main message loop for a player (legacy TCP, not used with WebRTC)."""
         try:
@@ -813,6 +922,14 @@ class GameServer:
             # Handle level pack requests during gameplay (for door transitions)
             level_name = deserialize_level_pack_request(payload)
             await self._handle_level_pack_request_dc(player, level_name)
+
+        elif msg_type == MessageType.LEVEL_MANIFEST_REQUEST:
+            level_name = deserialize_level_manifest_request(payload)
+            await self._handle_level_manifest_request_dc(player, level_name)
+
+        elif msg_type == MessageType.LEVEL_FILES_REQUEST:
+            level_name, filenames = deserialize_level_files_request(payload)
+            await self._handle_level_files_request_dc(player, level_name, filenames)
 
         elif msg_type == MessageType.MUTE_STATUS:
             player.is_muted = deserialize_mute_status(payload)

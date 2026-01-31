@@ -19,6 +19,10 @@ class MessageType(enum.IntEnum):
     LEVEL_PACK_REQUEST = 0x10  # Client -> Server: Request level by name
     LEVEL_PACK_DATA = 0x11  # Server -> Client: Tarball bytes
     DOOR_TRANSITION = 0x12  # Server -> Client: Player entered door, load new level
+    LEVEL_MANIFEST_REQUEST = 0x13  # Client -> Server: Request manifest for level
+    LEVEL_MANIFEST = 0x14  # Server -> Client: {filename: (hash, size), ...}
+    LEVEL_FILES_REQUEST = 0x15  # Client -> Server: List of filenames needed
+    LEVEL_FILES_DATA = 0x16  # Server -> Client: Concatenated file contents
     AUTH_CHALLENGE = 0x20  # Server -> Client: 32-byte nonce
     AUTH_RESPONSE = 0x21  # Client -> Server: pubkey + name + signature
     AUTH_RESULT = 0x22  # Server -> Client: success/error code
@@ -255,6 +259,94 @@ def deserialize_door_transition(data: bytes) -> tuple[str, int, int]:
     target_level = data[2 : 2 + level_len].decode("utf-8")
     spawn_x, spawn_y = struct.unpack(">HH", data[2 + level_len : 2 + level_len + 4])
     return target_level, spawn_x, spawn_y
+
+
+# LEVEL_MANIFEST_REQUEST: level name (same as LEVEL_PACK_REQUEST)
+def serialize_level_manifest_request(name: str) -> bytes:
+    name_bytes = name.encode("utf-8")
+    return struct.pack(">H", len(name_bytes)) + name_bytes
+
+
+def deserialize_level_manifest_request(data: bytes) -> str:
+    name_len = struct.unpack(">H", data[:2])[0]
+    return data[2 : 2 + name_len].decode("utf-8")
+
+
+# LEVEL_MANIFEST: JSON-encoded {filename: [hash, size], ...}
+def serialize_level_manifest(manifest: dict[str, tuple[str, int]]) -> bytes:
+    import json
+
+    # Convert tuples to lists for JSON serialization
+    json_manifest = {k: [v[0], v[1]] for k, v in manifest.items()}
+    json_bytes = json.dumps(json_manifest).encode("utf-8")
+    return struct.pack(">I", len(json_bytes)) + json_bytes
+
+
+def deserialize_level_manifest(data: bytes) -> dict[str, tuple[str, int]]:
+    import json
+
+    json_len = struct.unpack(">I", data[:4])[0]
+    json_bytes = data[4 : 4 + json_len]
+    json_manifest = json.loads(json_bytes.decode("utf-8"))
+    # Convert lists back to tuples
+    return {k: (v[0], v[1]) for k, v in json_manifest.items()}
+
+
+# LEVEL_FILES_REQUEST: list of filenames
+def serialize_level_files_request(level_name: str, filenames: list[str]) -> bytes:
+    import json
+
+    level_bytes = level_name.encode("utf-8")
+    json_bytes = json.dumps(filenames).encode("utf-8")
+    return (
+        struct.pack(">H", len(level_bytes))
+        + level_bytes
+        + struct.pack(">I", len(json_bytes))
+        + json_bytes
+    )
+
+
+def deserialize_level_files_request(data: bytes) -> tuple[str, list[str]]:
+    import json
+
+    level_len = struct.unpack(">H", data[:2])[0]
+    level_name = data[2 : 2 + level_len].decode("utf-8")
+    offset = 2 + level_len
+    json_len = struct.unpack(">I", data[offset : offset + 4])[0]
+    offset += 4
+    json_bytes = data[offset : offset + json_len]
+    filenames = json.loads(json_bytes.decode("utf-8"))
+    return level_name, filenames
+
+
+# LEVEL_FILES_DATA: concatenated files with headers [filename_len, filename, content_len, content, ...]
+def serialize_level_files_data(files: dict[str, bytes]) -> bytes:
+    result = struct.pack(">I", len(files))  # Number of files
+    for filename, content in files.items():
+        filename_bytes = filename.encode("utf-8")
+        result += struct.pack(">H", len(filename_bytes))
+        result += filename_bytes
+        result += struct.pack(">I", len(content))
+        result += content
+    return result
+
+
+def deserialize_level_files_data(data: bytes) -> dict[str, bytes]:
+    offset = 0
+    num_files = struct.unpack(">I", data[offset : offset + 4])[0]
+    offset += 4
+    files: dict[str, bytes] = {}
+    for _ in range(num_files):
+        filename_len = struct.unpack(">H", data[offset : offset + 2])[0]
+        offset += 2
+        filename = data[offset : offset + filename_len].decode("utf-8")
+        offset += filename_len
+        content_len = struct.unpack(">I", data[offset : offset + 4])[0]
+        offset += 4
+        content = data[offset : offset + content_len]
+        offset += content_len
+        files[filename] = content
+    return files
 
 
 # AUTH_CHALLENGE: 32-byte nonce

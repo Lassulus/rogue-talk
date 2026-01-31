@@ -26,6 +26,8 @@ from ..common.protocol import (
     deserialize_auth_challenge,
     deserialize_auth_result,
     deserialize_door_transition,
+    deserialize_level_files_data,
+    deserialize_level_manifest,
     deserialize_level_pack_data,
     deserialize_player_joined,
     deserialize_player_left,
@@ -35,6 +37,8 @@ from ..common.protocol import (
     deserialize_world_state,
     read_message,
     serialize_auth_response,
+    serialize_level_files_request,
+    serialize_level_manifest_request,
     serialize_level_pack_request,
     serialize_mute_status,
     serialize_position_update,
@@ -44,7 +48,14 @@ from ..common.protocol import (
 from .identity import Identity, load_or_create_identity
 from .input_handler import get_movement, is_mute_key, is_quit_key, is_show_names_key
 from .level import Level
-from .level_pack import extract_level_pack, parse_doors
+from .level_cache import cache_received_files, get_cached_files
+from .level_pack import (
+    LevelPack,
+    create_level_pack_from_dir,
+    extract_level_pack,
+    parse_doors,
+    write_files_to_dir,
+)
 from .terminal_ui import TerminalUI
 from .tile_sound_player import TileSoundPlayer
 
@@ -105,6 +116,9 @@ class GameClient:
         # WebRTC connection events
         self._data_channel_ready = asyncio.Event()
         self._connection_closed = asyncio.Event()
+        # Pending futures for level caching protocol
+        self._pending_manifest_future: asyncio.Future[bytes] | None = None
+        self._pending_files_future: asyncio.Future[bytes] | None = None
 
     async def connect(self) -> bool:
         """Connect to the server and complete handshake."""
@@ -175,32 +189,10 @@ class GameClient:
         self.level = Level.from_bytes(level_data)
         self.current_level = level_name
 
-        # Now request the correct level pack for doors and tiles
-        await write_message(
-            self.writer,
-            MessageType.LEVEL_PACK_REQUEST,
-            serialize_level_pack_request(level_name),
-        )
-
-        # Wait for LEVEL_PACK_DATA, handling other messages (like WORLD_STATE)
-        while True:
-            msg_type, payload = await read_message(self.reader)
-            if msg_type == MessageType.LEVEL_PACK_DATA:
-                break
-            # Ignore other messages during initial connection
-
-        tarball_data = deserialize_level_pack_data(payload)
-        if not tarball_data:
-            print("Server returned empty level pack")
-            return False
-
-        # Extract level pack to temp directory
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="rogue_talk_")
-        extract_dir = Path(self._temp_dir.name)
-        try:
-            level_pack = extract_level_pack(tarball_data, extract_dir)
-        except ValueError as e:
-            print(f"Failed to extract level pack: {e}")
+        # Request level files using content-addressed caching
+        level_pack = await self._request_level_cached_tcp(level_name)
+        if level_pack is None:
+            print("Failed to load level pack")
             return False
 
         # Load custom tiles if present
@@ -223,6 +215,79 @@ class GameClient:
         await self._load_see_through_portal_levels()
 
         return True
+
+    async def _request_level_cached_tcp(self, level_name: str) -> LevelPack | None:
+        """Request level files via TCP using content-addressed caching.
+
+        This is used during initial connection before WebRTC is established.
+        """
+        if not self.writer or not self.reader:
+            return None
+
+        # Request manifest
+        await write_message(
+            self.writer,
+            MessageType.LEVEL_MANIFEST_REQUEST,
+            serialize_level_manifest_request(level_name),
+        )
+
+        # Wait for LEVEL_MANIFEST
+        while True:
+            msg_type, payload = await read_message(self.reader)
+            if msg_type == MessageType.LEVEL_MANIFEST:
+                break
+            # Ignore other messages during initial connection
+
+        manifest = deserialize_level_manifest(payload)
+        if not manifest:
+            print("Server returned empty manifest")
+            return None
+
+        # Check local cache
+        cached_files, missing_files = get_cached_files(level_name, manifest)
+        cached_count = len(cached_files)
+        total_count = len(manifest)
+
+        if missing_files:
+            # Request missing files from server
+            await write_message(
+                self.writer,
+                MessageType.LEVEL_FILES_REQUEST,
+                serialize_level_files_request(level_name, missing_files),
+            )
+
+            # Wait for LEVEL_FILES_DATA
+            while True:
+                msg_type, payload = await read_message(self.reader)
+                if msg_type == MessageType.LEVEL_FILES_DATA:
+                    break
+                # Ignore other messages
+
+            new_files = deserialize_level_files_data(payload)
+
+            # Cache the new files
+            cache_received_files(level_name, manifest, new_files)
+
+            # Combine with cached files
+            all_files = {**cached_files, **new_files}
+            print(
+                f"Level {level_name}: {cached_count}/{total_count} cached, "
+                f"downloaded {len(new_files)} files"
+            )
+        else:
+            all_files = cached_files
+            print(f"Level {level_name}: {cached_count}/{total_count} files from cache")
+
+        # Write all files to temp directory
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="rogue_talk_")
+        extract_dir = Path(self._temp_dir.name)
+        write_files_to_dir(all_files, extract_dir)
+
+        try:
+            return create_level_pack_from_dir(extract_dir)
+        except ValueError as e:
+            print(f"Failed to create level pack: {e}")
+            return None
 
     async def _setup_webrtc(self) -> bool:
         """Set up WebRTC peer connection with the server."""
@@ -477,6 +542,16 @@ class GameClient:
             ):
                 self._pending_level_pack_future.set_result(payload)
 
+        elif msg_type == MessageType.LEVEL_MANIFEST:
+            # Handle level manifest data (for cached level loading)
+            if self._pending_manifest_future:
+                self._pending_manifest_future.set_result(payload)
+
+        elif msg_type == MessageType.LEVEL_FILES_DATA:
+            # Handle level files data (for cached level loading)
+            if self._pending_files_future:
+                self._pending_files_future.set_result(payload)
+
     def _send_data_channel_message(self, msg_type: MessageType, payload: bytes) -> None:
         """Send a message via WebRTC data channel."""
         if not self.webrtc_connected or self.data_channel is None:
@@ -512,6 +587,83 @@ class GameClient:
         finally:
             self._pending_level_pack_future = None  # type: ignore[assignment]
 
+    async def _request_level_cached_dc(
+        self, level_name: str, extract_dir: Path
+    ) -> LevelPack | None:
+        """Request level files via data channel using content-addressed caching.
+
+        This is used during gameplay for door transitions and portal level loading.
+        """
+        if not self.webrtc_connected:
+            return None
+
+        # Request manifest
+        self._pending_manifest_future = asyncio.Future()
+        self._send_data_channel_message(
+            MessageType.LEVEL_MANIFEST_REQUEST,
+            serialize_level_manifest_request(level_name),
+        )
+
+        # Wait for manifest
+        try:
+            payload = await asyncio.wait_for(
+                self._pending_manifest_future, timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending_manifest_future = None
+
+        manifest = deserialize_level_manifest(payload)
+        if not manifest:
+            return None
+
+        # Check local cache
+        cached_files, missing_files = get_cached_files(level_name, manifest)
+        cached_count = len(cached_files)
+        total_count = len(manifest)
+
+        if missing_files:
+            # Request missing files from server
+            self._pending_files_future = asyncio.Future()
+            self._send_data_channel_message(
+                MessageType.LEVEL_FILES_REQUEST,
+                serialize_level_files_request(level_name, missing_files),
+            )
+
+            # Wait for files
+            try:
+                payload = await asyncio.wait_for(
+                    self._pending_files_future, timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                self._pending_files_future = None
+
+            new_files = deserialize_level_files_data(payload)
+
+            # Cache the new files
+            cache_received_files(level_name, manifest, new_files)
+
+            # Combine with cached files
+            all_files = {**cached_files, **new_files}
+            print(
+                f"Level {level_name}: {cached_count}/{total_count} cached, "
+                f"downloaded {len(new_files)} files"
+            )
+        else:
+            all_files = cached_files
+            print(f"Level {level_name}: {cached_count}/{total_count} files from cache")
+
+        # Write all files to directory
+        write_files_to_dir(all_files, extract_dir)
+
+        try:
+            return create_level_pack_from_dir(extract_dir)
+        except ValueError:
+            return None
+
     async def _handle_door_transition(self, payload: bytes) -> None:
         """Handle a door transition to a new level."""
         target_level, spawn_x, spawn_y = deserialize_door_transition(payload)
@@ -523,20 +675,15 @@ class GameClient:
         # (POSITION_ACK may arrive while we're loading the new level)
         self._pending_moves.clear()
 
-        # Request the new level pack via data channel
-        tarball_data = await self._request_level_pack(target_level)
-        if not tarball_data:
-            return
-
         # Clean up old temp directory and create new one
         if self._temp_dir:
             self._temp_dir.cleanup()
         self._temp_dir = tempfile.TemporaryDirectory(prefix="rogue_talk_")
         extract_dir = Path(self._temp_dir.name)
 
-        try:
-            level_pack = extract_level_pack(tarball_data, extract_dir)
-        except ValueError:
+        # Request level files using content-addressed caching
+        level_pack = await self._request_level_cached_dc(target_level, extract_dir)
+        if level_pack is None:
             return
 
         # Load custom tiles if present
@@ -610,19 +757,15 @@ class GameClient:
             if target_level_name in self.other_levels:
                 continue  # Already loaded
 
-            # Request the level pack via data channel
-            tarball_data = await self._request_level_pack(target_level_name)
-            if not tarball_data:
-                continue
-
-            # Extract to a subdirectory for this level
             if not self._temp_dir:
                 continue
             extract_dir = Path(self._temp_dir.name) / f"other_{target_level_name}"
 
-            try:
-                level_pack = extract_level_pack(tarball_data, extract_dir)
-            except ValueError:
+            # Request level files using content-addressed caching
+            level_pack = await self._request_level_cached_dc(
+                target_level_name, extract_dir
+            )
+            if level_pack is None:
                 continue
 
             # Load the level from the pack
