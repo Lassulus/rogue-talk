@@ -255,6 +255,10 @@ class GameClient:
             await self._stop_audio()
             if self.writer:
                 self.writer.close()
+                try:
+                    await self.writer.wait_closed()
+                except Exception:
+                    pass  # Connection may already be gone
             if self._temp_dir:
                 self._temp_dir.cleanup()
             self.ui.cleanup()
