@@ -216,14 +216,6 @@ class GameServer:
     async def handle_client(self, reader: StreamReader, writer: StreamWriter) -> None:
         player: Player | None = None
         try:
-            # First message should be LEVEL_PACK_REQUEST
-            msg_type, payload = await read_message(reader)
-            if msg_type == MessageType.LEVEL_PACK_REQUEST:
-                level_name = deserialize_level_pack_request(payload)
-                await self._handle_level_pack_request(writer, level_name)
-            else:
-                return
-
             # Send AUTH_CHALLENGE with random nonce
             nonce = os.urandom(32)
             await write_message(
@@ -345,6 +337,7 @@ class GameServer:
                     spawn_x,
                     spawn_y,
                     player_level.to_bytes(),
+                    current_level,
                 ),
             )
 

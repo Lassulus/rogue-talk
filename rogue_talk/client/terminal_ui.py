@@ -373,16 +373,23 @@ class TerminalUI:
         player_y: int,
         level: Level,
         other_levels: dict[str, Level],
+        depth: int = 0,
+        accumulated_distance: float = 0.0,
     ) -> tuple[Level, int, int, float] | None:
         """Check if viewing through a see-through portal to see a target cell.
 
         Traces line of sight from player to target. If a see-through portal is
         encountered, returns the mapped position in the target level.
+        Recursively checks for chained portals up to a maximum depth.
 
         Returns:
             Tuple of (target_level, mapped_x, mapped_y, total_distance) if viewing
             through a portal, or None if not.
         """
+        # Limit portal chain depth to prevent infinite loops
+        if depth > 5:
+            return None
+
         if not level.doors:
             return None
 
@@ -434,10 +441,18 @@ class TerminalUI:
                     # Same-level teleporter
                     target_level = level
 
-                # Calculate total distance (player to portal + portal to mapped)
+                # Check line of sight in target level (from portal exit to mapped position)
+                if not self._has_line_of_sight(
+                    door.target_x, door.target_y, mapped_x, mapped_y, target_level
+                ):
+                    return None
+
+                # Calculate distance so far
                 dist_to_portal = math.sqrt((x - player_x) ** 2 + (y - player_y) ** 2)
                 dist_from_portal = math.sqrt(offset_x**2 + offset_y**2)
-                total_distance = dist_to_portal + dist_from_portal
+                total_distance = (
+                    accumulated_distance + dist_to_portal + dist_from_portal
+                )
 
                 return (target_level, mapped_x, mapped_y, total_distance)
 
@@ -452,8 +467,18 @@ class TerminalUI:
         self, tile_char: str, distance: float, tile_x: int = 0
     ) -> str:
         """Render a tile seen through a portal with magenta tint."""
+        # Void/space tiles should render as empty
+        if tile_char == " ":
+            return " "
+
         tile_def = tiles.get_tile(tile_char)
-        display_char = tile_def.render_char if tile_def.render_char else tile_def.char
+        # For unknown tiles (from other levels), use the raw character
+        if tile_def.char == "?":
+            display_char = tile_char
+        else:
+            display_char = (
+                tile_def.render_char if tile_def.render_char else tile_def.char
+            )
 
         # Apply distance-based magenta tinting
         if distance <= LIGHT_FULL_RADIUS:

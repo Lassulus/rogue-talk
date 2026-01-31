@@ -101,43 +101,6 @@ class GameClient:
             print(f"Failed to connect: {e}")
             return False
 
-        # Request level pack first
-        await write_message(
-            self.writer,
-            MessageType.LEVEL_PACK_REQUEST,
-            serialize_level_pack_request("main"),
-        )
-
-        # Wait for LEVEL_PACK_DATA
-        msg_type, payload = await read_message(self.reader)
-        if msg_type != MessageType.LEVEL_PACK_DATA:
-            print("Unexpected response from server (expected LEVEL_PACK_DATA)")
-            return False
-
-        tarball_data = deserialize_level_pack_data(payload)
-        if not tarball_data:
-            print("Server returned empty level pack")
-            return False
-
-        # Extract level pack to temp directory
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="rogue_talk_")
-        extract_dir = Path(self._temp_dir.name)
-        try:
-            level_pack = extract_level_pack(tarball_data, extract_dir)
-        except ValueError as e:
-            print(f"Failed to extract level pack: {e}")
-            return False
-
-        # Load custom tiles if present
-        if level_pack.tiles_path:
-            tile_defs.reload_tiles(level_pack.tiles_path)
-
-        # Set up sound assets directory
-        self._sound_cache.set_assets_dir(level_pack.assets_dir)
-
-        # Parse doors from level.json
-        doors = parse_doors(level_pack.level_json_path)
-
         # Wait for AUTH_CHALLENGE
         msg_type, payload = await read_message(self.reader)
         if msg_type != MessageType.AUTH_CHALLENGE:
@@ -176,7 +139,7 @@ class GameClient:
             )
             return False
 
-        # Wait for SERVER_HELLO
+        # Wait for SERVER_HELLO to learn which level we're in
         msg_type, payload = await read_message(self.reader)
         if msg_type != MessageType.SERVER_HELLO:
             print("Unexpected response from server")
@@ -189,8 +152,47 @@ class GameClient:
             self.x,
             self.y,
             level_data,
+            level_name,
         ) = deserialize_server_hello(payload)
         self.level = Level.from_bytes(level_data)
+
+        # Now request the correct level pack for doors and tiles
+        await write_message(
+            self.writer,
+            MessageType.LEVEL_PACK_REQUEST,
+            serialize_level_pack_request(level_name),
+        )
+
+        # Wait for LEVEL_PACK_DATA, handling other messages (like WORLD_STATE)
+        while True:
+            msg_type, payload = await read_message(self.reader)
+            if msg_type == MessageType.LEVEL_PACK_DATA:
+                break
+            # Ignore other messages during initial connection
+
+        tarball_data = deserialize_level_pack_data(payload)
+        if not tarball_data:
+            print("Server returned empty level pack")
+            return False
+
+        # Extract level pack to temp directory
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="rogue_talk_")
+        extract_dir = Path(self._temp_dir.name)
+        try:
+            level_pack = extract_level_pack(tarball_data, extract_dir)
+        except ValueError as e:
+            print(f"Failed to extract level pack: {e}")
+            return False
+
+        # Load custom tiles if present
+        if level_pack.tiles_path:
+            tile_defs.reload_tiles(level_pack.tiles_path)
+
+        # Set up sound assets directory
+        self._sound_cache.set_assets_dir(level_pack.assets_dir)
+
+        # Parse and set doors from level.json
+        doors = parse_doors(level_pack.level_json_path)
         self.level.doors = doors
 
         # Load other levels for see-through portals
