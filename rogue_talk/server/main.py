@@ -2,9 +2,22 @@
 
 import argparse
 import asyncio
+import logging
 
 from ..common.constants import DEFAULT_HOST, DEFAULT_PORT
 from .game_server import GameServer
+
+
+def setup_logging(log_file: str) -> None:
+    """Configure logging to file and console."""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(),
+        ],
+    )
 
 
 def main() -> None:
@@ -23,7 +36,12 @@ def main() -> None:
         default="./data",
         help="Directory for player data storage (default: ./data)",
     )
+    parser.add_argument(
+        "--log-file", default="rogue_talk_server.log", help="Log file path"
+    )
     args = parser.parse_args()
+
+    setup_logging(args.log_file)
 
     server = GameServer(
         args.host, args.port, levels_dir=args.levels_dir, data_dir=args.data_dir

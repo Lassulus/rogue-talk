@@ -48,6 +48,10 @@ class JitterBuffer:
 
         return self.packets.popleft()
 
+    def has_started(self) -> bool:
+        """Check if playback has started for this buffer."""
+        return self.playback_started
+
     def reset(self) -> None:
         """Reset buffer state."""
         self.packets.clear()

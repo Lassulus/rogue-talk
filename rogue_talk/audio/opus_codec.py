@@ -16,6 +16,13 @@ class OpusEncoder:
         self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
         self.encoder.bitrate = OPUS_BITRATE
 
+        # Enable FEC for packet loss resilience (embeds redundant data for previous frame)
+        self.encoder.ctl(opuslib.api.ctl.set_inband_fec, 1)
+        self.encoder.ctl(opuslib.api.ctl.set_packet_loss_perc, 10)  # Expect 10% loss
+
+        # Enable DTX to save bandwidth during silence
+        self.encoder.ctl(opuslib.api.ctl.set_dtx, 1)
+
     def encode(self, pcm_data: npt.NDArray[np.float32]) -> bytes:
         """Encode PCM float32 data to Opus."""
         # Convert float32 [-1.0, 1.0] to int16
@@ -30,8 +37,12 @@ class OpusDecoder:
     def __init__(self) -> None:
         self.decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
 
-    def decode(self, opus_data: bytes) -> npt.NDArray[np.float32]:
-        """Decode Opus data to PCM float32."""
+    def decode(self, opus_data: bytes | None) -> npt.NDArray[np.float32]:
+        """Decode Opus data to PCM float32.
+
+        If opus_data is None, uses Opus PLC (Packet Loss Concealment) to
+        generate smooth audio based on the previous frame.
+        """
         pcm_bytes: bytes = self.decoder.decode(opus_data, FRAME_SIZE)
         pcm_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
         return pcm_int16.astype(np.float32) / 32767.0
