@@ -99,10 +99,10 @@ class TerminalUI:
             self.anim_frame += 1
             self._last_anim_time = now
 
-        output = []
+        output: list[str] = []
 
-        # Clear screen and move to top
-        output.append(self.term.home + self.term.clear)
+        # Move to top (don't clear - overwrite in place to avoid flicker)
+        output.append(str(self.term.home))
 
         # Get viewport sized to terminal
         viewport = self._get_viewport()
@@ -130,10 +130,11 @@ class TerminalUI:
                     show_player_names,
                 )
                 row += char
-            output.append(row)
+            output.append(row + str(self.term.clear_eol))
 
         # Status bar
-        output.append("")
+        clear_eol = str(self.term.clear_eol)
+        output.append(clear_eol)
         local_player = next(
             (p for p in players if p.player_id == local_player_id), None
         )
@@ -143,7 +144,7 @@ class TerminalUI:
         status = f"[{mute_status}] Players: {player_count}"
         if local_player:
             status += f" | Position: ({local_player.x}, {local_player.y})"
-        output.append(status)
+        output.append(status + clear_eol)
 
         # Mic level (green 0-50%, yellow 50-90%, red 90-100%)
         level_chars = int(mic_level * 20)
@@ -151,19 +152,24 @@ class TerminalUI:
         yellow_part = self.term.yellow("#" * max(0, min(level_chars - 10, 8)))
         red_part = self.term.red("#" * max(0, level_chars - 18))
         padding = " " * (20 - level_chars)
-        output.append(f"Mic: [{green_part}{yellow_part}{red_part}{padding}]")
+        output.append(f"Mic: [{green_part}{yellow_part}{red_part}{padding}]{clear_eol}")
 
         # Player list
-        output.append("")
-        output.append("Players:")
+        output.append(clear_eol)
+        output.append("Players:" + clear_eol)
         for p in players:
             marker = ">" if p.player_id == local_player_id else " "
             muted = " (muted)" if p.is_muted else ""
-            output.append(f"  {marker} {p.name} at ({p.x}, {p.y}){muted}")
+            output.append(f"  {marker} {p.name} at ({p.x}, {p.y}){muted}{clear_eol}")
 
         # Controls
-        output.append("")
-        output.append("Controls: WASD/HJKL/Arrows=Move, M=Mute, Tab=Names, Q=Quit")
+        output.append(clear_eol)
+        output.append(
+            f"Controls: WASD/HJKL/Arrows=Move, M=Mute, Tab=Names, Q=Quit{clear_eol}"
+        )
+
+        # Clear any remaining lines from previous frame
+        output.append(str(self.term.clear_eos))
 
         print("\n".join(output), end="", flush=True)
 
