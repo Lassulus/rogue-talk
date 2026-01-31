@@ -5,8 +5,13 @@ import io
 import json
 import os
 import tarfile
+import time
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
+
+# Ping/keepalive settings
+PING_INTERVAL = 10.0  # Send ping every 10 seconds
+PING_TIMEOUT = 30.0  # Disconnect if no pong within 30 seconds
 
 from ..common.crypto import verify_signature
 from ..common.protocol import (
@@ -352,10 +357,20 @@ class GameServer:
                 f"Player {name} (id={player_id}) joined at ({spawn_x}, {spawn_y}){returning}"
             )
 
-            # Main message loop
-            while True:
-                msg_type, payload = await read_message(reader)
-                await self._handle_message(player, msg_type, payload)
+            # Run message loop and ping task concurrently
+            message_task = asyncio.create_task(self._message_loop(player, reader))
+            ping_task = asyncio.create_task(self._ping_loop(player))
+
+            # Wait for either to finish (first one to finish cancels the other)
+            done, pending = await asyncio.wait(
+                [message_task, ping_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         except (
             asyncio.IncompleteReadError,
@@ -394,6 +409,31 @@ class GameServer:
             MessageType.LEVEL_PACK_DATA,
             serialize_level_pack_data(tarball),
         )
+
+    async def _message_loop(self, player: Player, reader: StreamReader) -> None:
+        """Main message loop for a player."""
+        while True:
+            msg_type, payload = await read_message(reader)
+            await self._handle_message(player, msg_type, payload)
+
+    async def _ping_loop(self, player: Player) -> None:
+        """Send periodic pings to check if client is alive."""
+        while True:
+            await asyncio.sleep(PING_INTERVAL)
+
+            # Check if client responded to recent pings
+            time_since_pong = time.monotonic() - player.last_pong_time
+            if time_since_pong > PING_TIMEOUT:
+                print(
+                    f"Player {player.name} timed out (no pong for {time_since_pong:.1f}s)"
+                )
+                return  # Exit loop, which will trigger disconnect
+
+            # Send ping
+            try:
+                await write_message(player.writer, MessageType.PING, b"")
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                return  # Connection dead
 
     async def _handle_door_transition(
         self, player: Player, door_info: DoorInfo, seq: int
@@ -523,6 +563,9 @@ class GameServer:
         elif msg_type == MessageType.MUTE_STATUS:
             player.is_muted = deserialize_mute_status(payload)
             await self._broadcast_world_state()
+
+        elif msg_type == MessageType.PONG:
+            player.last_pong_time = time.monotonic()
 
     async def _route_audio(self, source: Player, frame: AudioFrame) -> None:
         """Route audio frame to nearby players with volume scaling."""

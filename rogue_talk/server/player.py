@@ -1,5 +1,6 @@
 """Player state for the server."""
 
+import time
 from asyncio import StreamReader, StreamWriter
 from dataclasses import dataclass, field
 
@@ -15,3 +16,4 @@ class Player:
     is_muted: bool = False
     current_level: str = "main"  # Name of the level the player is currently on
     public_key: bytes = b""  # Ed25519 public key for authentication
+    last_pong_time: float = field(default_factory=time.monotonic)

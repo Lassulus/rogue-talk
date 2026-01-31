@@ -22,6 +22,8 @@ class MessageType(enum.IntEnum):
     AUTH_CHALLENGE = 0x20  # Server -> Client: 32-byte nonce
     AUTH_RESPONSE = 0x21  # Client -> Server: pubkey + name + signature
     AUTH_RESULT = 0x22  # Server -> Client: success/error code
+    PING = 0x30  # Server -> Client: keepalive ping
+    PONG = 0x31  # Client -> Server: keepalive pong
 
 
 @dataclass

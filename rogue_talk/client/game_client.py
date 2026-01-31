@@ -328,6 +328,14 @@ class GameClient:
         elif msg_type == MessageType.DOOR_TRANSITION:
             await self._handle_door_transition(payload)
 
+        elif msg_type == MessageType.PING:
+            # Respond with PONG to keep connection alive
+            if self.writer:
+                try:
+                    await write_message(self.writer, MessageType.PONG, b"")
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+
     async def _handle_door_transition(self, payload: bytes) -> None:
         """Handle a door transition to a new level."""
         target_level, spawn_x, spawn_y = deserialize_door_transition(payload)
