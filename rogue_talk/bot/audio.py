@@ -3,23 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import wave
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 
 from ..common.constants import FRAME_SIZE, SAMPLE_RATE
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    pass
 
 
 class AudioSource(ABC):
@@ -52,7 +43,6 @@ class FileAudioSource(AudioSource):
         self._path = Path(path)
         self._samples: npt.NDArray[np.float32] | None = None
         self._position = 0
-        self._frame_count = 0
         self._load_file()
 
     def _load_file(self) -> None:
@@ -171,14 +161,6 @@ class FileAudioSource(AudioSource):
             audio = self._resample(audio, framerate, SAMPLE_RATE)
 
         self._samples = audio.astype(np.float32)
-        # Find where non-zero audio starts
-        nonzero_indices = np.where(np.abs(self._samples) > 0.001)[0]
-        first_nonzero = nonzero_indices[0] if len(nonzero_indices) > 0 else -1
-        logger.info(
-            f"Loaded audio: {len(self._samples)} samples ({len(self._samples) / SAMPLE_RATE:.2f}s), "
-            f"max amplitude: {np.abs(self._samples).max():.4f}, "
-            f"first nonzero sample at index {first_nonzero}"
-        )
 
     def _resample(
         self,
@@ -205,24 +187,13 @@ class FileAudioSource(AudioSource):
     async def get_samples(self) -> npt.NDArray[np.float32] | None:
         """Get the next frame of audio samples."""
         if self._samples is None:
-            logger.info("get_samples: _samples is None")
             return None
         if self._position >= len(self._samples):
-            logger.info(
-                f"get_samples: position {self._position} >= len {len(self._samples)}, total frames: {self._frame_count}"
-            )
             return None
 
         end = min(self._position + FRAME_SIZE, len(self._samples))
         frame = self._samples[self._position : end]
         self._position = end
-        self._frame_count += 1
-
-        # Log every 10th frame to track progress
-        if self._frame_count % 10 == 0:
-            logger.info(
-                f"Audio frame {self._frame_count}: pos={self._position}/{len(self._samples)}, max={np.abs(frame).max():.4f}"
-            )
 
         # Pad with zeros if needed
         if len(frame) < FRAME_SIZE:
@@ -233,14 +204,8 @@ class FileAudioSource(AudioSource):
     def is_finished(self) -> bool:
         """Check if all samples have been read."""
         if self._samples is None:
-            logger.info("is_finished: _samples is None")
             return True
-        finished = self._position >= len(self._samples)
-        if finished:
-            logger.info(
-                f"is_finished: position {self._position} >= len {len(self._samples)}, frames: {self._frame_count}"
-            )
-        return finished
+        return self._position >= len(self._samples)
 
     def reset(self) -> None:
         """Reset playback to the beginning."""

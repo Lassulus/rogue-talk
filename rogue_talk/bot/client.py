@@ -555,7 +555,12 @@ class BotClient:
         """Handle a message received via WebRTC data channel."""
         if len(data) < 1:
             return
-        msg_type = MessageType(data[0])
+        try:
+            msg_type = MessageType(data[0])
+        except ValueError:
+            # Unknown message type - ignore it
+            logger.debug(f"Ignoring unknown message type: {data[0]}")
+            return
         payload = data[1:]
         await self._handle_server_message(msg_type, payload)
 

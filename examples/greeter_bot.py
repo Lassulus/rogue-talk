@@ -23,12 +23,11 @@ from rogue_talk.bot import BotClient, BotConfig, Direction, PlayerState, WorldSt
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("greeter_bot")
-logging.getLogger("rogue_talk.bot").setLevel(logging.DEBUG)
-# Silence aiortc spam
+# Silence noisy loggers
 logging.getLogger("aiortc").setLevel(logging.WARNING)
 logging.getLogger("aioice").setLevel(logging.WARNING)
 
@@ -81,9 +80,7 @@ async def main() -> None:
     @bot.on_world_state
     async def on_world_state(world: WorldState) -> None:
         """Called on world state updates."""
-        other_players = [p for p in world.players if p.player_id != bot.player_id]
-        if other_players:
-            logger.debug(f"World state: {len(other_players)} other players")
+        pass  # Can be used to track world state if needed
 
     @bot.on_player_joined
     async def on_player_joined(player_id: int, name: str) -> None:
@@ -129,14 +126,11 @@ async def wander(bot: BotClient) -> None:
         direction = random.choice(directions)
 
         # Try to move
-        if await bot.move(direction):
-            logger.debug(f"Moved {direction.name} to ({bot.x}, {bot.y})")
-        else:
+        if not await bot.move(direction):
             # If blocked, try other directions
             random.shuffle(directions)
             for alt_direction in directions:
                 if await bot.move(alt_direction):
-                    logger.debug(f"Moved {alt_direction.name} to ({bot.x}, {bot.y})")
                     break
 
 

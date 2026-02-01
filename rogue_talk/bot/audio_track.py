@@ -95,30 +95,17 @@ class BotAudioCaptureTrack(MediaStreamTrack):
                 # Try current source
                 if self._current_source is not None:
                     if self._current_source.is_finished():
-                        elapsed = time.time() - self._start_time
-                        logger.info(
-                            f"Audio source finished after {elapsed:.3f}s, frames sent: {self._timestamp // self._frame_size}"
-                        )
                         self._current_source = None
                     else:
                         pcm_data = await self._current_source.get_samples()
                         if pcm_data is None:
-                            elapsed = time.time() - self._start_time
-                            logger.info(
-                                f"Audio source returned None after {elapsed:.3f}s"
-                            )
                             self._current_source = None
 
                 # Try to get next source from queue
                 if self._current_source is None:
                     try:
                         self._current_source = self._source_queue.get_nowait()
-                        logger.info(f"Got new audio source from queue")
                         pcm_data = await self._current_source.get_samples()
-                        if pcm_data is not None:
-                            logger.info(
-                                f"First audio frame: {len(pcm_data)} samples, max={np.abs(pcm_data).max():.4f}"
-                            )
                     except asyncio.QueueEmpty:
                         pass
 
