@@ -50,7 +50,7 @@ from ..common.protocol import (
     serialize_world_state,
     write_message,
 )
-from .audio_router import get_audio_recipients
+from .audio_router import clear_recipient_cache, get_audio_recipients
 from .level import DoorInfo, Level
 from .player import Player
 from .storage import PlayerStorage
@@ -638,6 +638,7 @@ class GameServer:
 
                 async with self._lock:
                     self.players.pop(player.id, None)
+                clear_recipient_cache()  # Invalidate audio routing cache
                 await self._broadcast_player_left(player.id)
                 print(f"Player {player.name} (id={player.id}) left")
 

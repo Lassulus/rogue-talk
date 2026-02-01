@@ -5,25 +5,32 @@ import math
 from ..common.constants import AUDIO_FULL_VOLUME_DISTANCE, AUDIO_MAX_DISTANCE
 from .player import Player
 
+# Pre-computed squared thresholds
+_MAX_DISTANCE_SQ = int(AUDIO_MAX_DISTANCE * AUDIO_MAX_DISTANCE)  # 100
+_FULL_VOLUME_DISTANCE_SQ = AUDIO_FULL_VOLUME_DISTANCE * AUDIO_FULL_VOLUME_DISTANCE
 
-def calculate_distance(pos1: tuple[int, int], pos2: tuple[int, int]) -> float:
-    """Calculate Euclidean distance between two positions."""
-    dx = pos1[0] - pos2[0]
-    dy = pos1[1] - pos2[1]
-    return math.sqrt(dx * dx + dy * dy)
+# Lookup table: _VOLUME_TABLE[squared_distance] -> volume
+# Precomputed at module load, no sqrt needed at runtime
+_VOLUME_TABLE: tuple[float, ...] = tuple(
+    1.0
+    if dist_sq <= _FULL_VOLUME_DISTANCE_SQ
+    else 1.0
+    - (math.sqrt(dist_sq) - AUDIO_FULL_VOLUME_DISTANCE)
+    / (AUDIO_MAX_DISTANCE - AUDIO_FULL_VOLUME_DISTANCE)
+    for dist_sq in range(_MAX_DISTANCE_SQ + 1)
+)
 
 
-def calculate_volume(distance: float) -> float:
-    """Calculate volume multiplier based on distance (0.0 to 1.0)."""
-    if distance <= AUDIO_FULL_VOLUME_DISTANCE:
-        return 1.0
-    if distance >= AUDIO_MAX_DISTANCE:
+def get_volume(dx: int, dy: int) -> float:
+    """Get volume for a position offset. Uses lookup table, no sqrt at runtime."""
+    dist_sq = dx * dx + dy * dy
+    if dist_sq > _MAX_DISTANCE_SQ:
         return 0.0
-    # Linear falloff
-    normalized = (distance - AUDIO_FULL_VOLUME_DISTANCE) / (
-        AUDIO_MAX_DISTANCE - AUDIO_FULL_VOLUME_DISTANCE
-    )
-    return 1.0 - normalized
+    return _VOLUME_TABLE[dist_sq]
+
+
+# Cache for recipient lists: source_id -> (source_pos, [(player, volume), ...])
+_recipient_cache: dict[int, tuple[tuple[int, int], list[tuple[Player, float]]]] = {}
 
 
 def get_audio_recipients(
@@ -31,22 +38,48 @@ def get_audio_recipients(
 ) -> list[tuple[Player, float]]:
     """
     Get list of (player, volume) tuples for players who should receive
-    audio from the source player.
+    audio from the source player. Results are cached until positions change.
     """
     if source.is_muted:
         return []
 
-    recipients = []
-    source_pos = (source.x, source.y)
+    source_x, source_y = source.x, source.y
 
+    # Check cache - valid if source hasn't moved
+    cached = _recipient_cache.get(source.id)
+    if cached is not None:
+        cached_pos, cached_recipients = cached
+        if cached_pos == (source_x, source_y):
+            # Verify recipients haven't moved either
+            still_valid = True
+            for player, old_volume in cached_recipients:
+                if player.id not in players:
+                    still_valid = False
+                    break
+                new_volume = get_volume(player.x - source_x, player.y - source_y)
+                if abs(new_volume - old_volume) > 0.01:
+                    still_valid = False
+                    break
+            if still_valid:
+                return cached_recipients
+
+    # Rebuild recipient list
+    recipients = []
     for player_id, player in players.items():
         if player_id == source.id:
             continue
 
-        distance = calculate_distance(source_pos, (player.x, player.y))
-        volume = calculate_volume(distance)
-
+        volume = get_volume(player.x - source_x, player.y - source_y)
         if volume > 0.0:
             recipients.append((player, volume))
 
+    _recipient_cache[source.id] = ((source_x, source_y), recipients)
     return recipients
+
+
+def clear_recipient_cache(player_id: int | None = None) -> None:
+    """Clear cached recipients for a player, or all if player_id is None."""
+    if player_id is None:
+        _recipient_cache.clear()
+    else:
+        _recipient_cache.pop(player_id, None)

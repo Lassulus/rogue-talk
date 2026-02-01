@@ -40,10 +40,12 @@ class AudioPlayback:
         self.tile_sound_player: TileSoundPlayer | None = None
         # WebRTC audio track for receiving voice
         self.webrtc_track: AudioPlaybackTrack | None = None
-        # Buffer for WebRTC audio samples (numpy array for efficiency)
-        self._webrtc_sample_buffer: npt.NDArray[np.float32] = np.array(
-            [], dtype=np.float32
+        # Pre-allocated ring buffer for WebRTC audio samples (avoids repeated allocations)
+        self._webrtc_ring_buffer: npt.NDArray[np.float32] = np.zeros(
+            self.WEBRTC_MAX_BUFFER * 2, dtype=np.float32
         )
+        self._webrtc_write_pos = 0
+        self._webrtc_read_pos = 0
         # Track if WebRTC playback has started (for jitter buffering)
         self._webrtc_playback_started = False
         # Diagnostics
@@ -105,38 +107,60 @@ class AudioPlayback:
         webrtc_frame: npt.NDArray[np.float32] | None = None
 
         if self.webrtc_track is not None:
-            # Drain all available frames from WebRTC track into buffer
+            ring_buf = self._webrtc_ring_buffer
+            buf_size = len(ring_buf)
+
+            # Drain all available frames from WebRTC track into ring buffer
             while True:
                 frame_data = self.webrtc_track.get_frame()
                 if frame_data is None:
                     break
                 pcm_data, volume = frame_data
-                # Flatten to 1D and apply volume
-                samples = pcm_data.flatten() * volume
-                # Append to buffer
-                self._webrtc_sample_buffer = np.concatenate(
-                    [self._webrtc_sample_buffer, samples.astype(np.float32)]
-                )
+                samples = pcm_data.flatten()
+                sample_len = len(samples)
 
-            buffer_len = len(self._webrtc_sample_buffer)
+                # Check if we have space (avoid overflow)
+                available = (
+                    self._webrtc_read_pos - self._webrtc_write_pos - 1
+                ) % buf_size
+                if available == 0:
+                    available = buf_size - 1
+                if sample_len > available:
+                    # Buffer full, discard oldest data by advancing read pointer
+                    discard = sample_len - available
+                    self._webrtc_read_pos = (self._webrtc_read_pos + discard) % buf_size
+
+                # Write samples to ring buffer (handle wrap-around)
+                write_pos = self._webrtc_write_pos
+                end_pos = write_pos + sample_len
+                if end_pos <= buf_size:
+                    ring_buf[write_pos:end_pos] = samples * volume
+                else:
+                    first_part = buf_size - write_pos
+                    ring_buf[write_pos:buf_size] = samples[:first_part] * volume
+                    ring_buf[: end_pos - buf_size] = samples[first_part:] * volume
+                self._webrtc_write_pos = end_pos % buf_size
+
+            # Calculate buffered samples
+            buffer_len = (self._webrtc_write_pos - self._webrtc_read_pos) % buf_size
 
             # Jitter buffering: wait for minimum buffer before starting playback
             if not self._webrtc_playback_started:
                 if buffer_len >= self.WEBRTC_MIN_BUFFER:
                     self._webrtc_playback_started = True
-                # Don't output anything until we have enough buffer
 
             # Extract exactly FRAME_SIZE samples for this callback
             if self._webrtc_playback_started and buffer_len >= FRAME_SIZE:
-                webrtc_frame = self._webrtc_sample_buffer[:FRAME_SIZE]
-                self._webrtc_sample_buffer = self._webrtc_sample_buffer[FRAME_SIZE:]
-
-                # Prevent buffer from growing too large (discard old data)
-                if len(self._webrtc_sample_buffer) > self.WEBRTC_MAX_BUFFER:
-                    # Keep only the most recent data
-                    self._webrtc_sample_buffer = self._webrtc_sample_buffer[
-                        -self.WEBRTC_MAX_BUFFER :
-                    ]
+                read_pos = self._webrtc_read_pos
+                end_pos = read_pos + FRAME_SIZE
+                if end_pos <= buf_size:
+                    webrtc_frame = ring_buf[read_pos:end_pos].copy()
+                else:
+                    first_part = buf_size - read_pos
+                    webrtc_frame = np.concatenate(
+                        [ring_buf[read_pos:buf_size], ring_buf[: end_pos - buf_size]]
+                    )
+                self._webrtc_read_pos = end_pos % buf_size
             elif self._webrtc_playback_started and buffer_len < FRAME_SIZE:
                 # Buffer underrun - reset playback state to rebuffer
                 self._webrtc_playback_started = False
