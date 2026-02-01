@@ -71,11 +71,38 @@
             meta.mainProgram = "rogue-talk-client";
           };
         in
-        {
+        rec {
           inherit rogue-talk;
           default = rogue-talk;
           client = rogue-talk.overrideAttrs { meta.mainProgram = "rogue-talk-client"; };
           server = rogue-talk.overrideAttrs { meta.mainProgram = "rogue-talk-server"; };
+          bot-greeter =
+            let
+              pythonEnv = python.withPackages (ps: [
+                ps.blessed
+                ps.sounddevice
+                ps.soundfile
+                opuslib_next
+                ps.numpy
+                ps.cryptography
+                ps.aiortc
+                ps.aiohttp
+              ]);
+              examples = ./examples;
+            in
+            pkgs.writeShellScriptBin "bot-greeter" ''
+              export LD_LIBRARY_PATH="${
+                pkgs.lib.makeLibraryPath [
+                  pkgs.libopus
+                  pkgs.portaudio
+                  pkgs.libsndfile
+                  pkgs.libvpx
+                  pkgs.ffmpeg
+                ]
+              }:$LD_LIBRARY_PATH"
+              export PYTHONPATH="${./.}:$PYTHONPATH"
+              exec ${pythonEnv}/bin/python ${examples}/greeter_bot.py "$@"
+            '';
         }
       );
 
