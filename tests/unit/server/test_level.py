@@ -25,12 +25,12 @@ class TestLevelFromString:
         assert len(level.spawn_positions) == 1
         assert (4, 2) in level.spawn_positions
 
-    def test_spawn_replaced_with_floor(self, sample_level_string: str) -> None:
-        """Test that spawn marker is replaced with floor."""
+    def test_spawn_tile_preserved(self, sample_level_string: str) -> None:
+        """Test that spawn marker tile is preserved in the level."""
         level = Level.from_string(sample_level_string)
 
-        # Where 'S' was, should now be '.'
-        assert level.tiles[2][4] == "."
+        # The 'S' spawn tile should be preserved as-is
+        assert level.tiles[2][4] == "S"
 
     def test_empty_level(self) -> None:
         """Test parsing empty level."""

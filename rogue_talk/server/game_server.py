@@ -199,7 +199,64 @@ class GameServer:
         if level_json_data:
             self._parse_level_json(level, level_json_data)
 
+        # Validate door consistency
+        self._validate_doors(name, level, tiles)
+
         return level, tiles
+
+    def _validate_doors(
+        self, level_name: str, level: Level, tiles: dict[str, tile_defs.TileDef]
+    ) -> None:
+        """Validate that door/teleporter tiles and level.json are consistent.
+
+        Both doors (cross-level) and teleporters (same-level) use the same
+        mechanism: tiles with is_door=true and entries in level.json's doors array.
+
+        Logs warnings for:
+        - Doors/teleporters in level.json at positions without is_door tiles
+        - Tiles with is_door=true that have no level.json entry
+        - Same-level teleporters with invalid target positions
+        """
+        # Check doors defined in level.json
+        for pos, door in level.doors.items():
+            x, y = pos
+            tile_char = level.get_tile(x, y)
+            tile_def = tiles.get(tile_char, tile_defs.DEFAULT_TILE)
+            if not tile_def.is_door:
+                target = door.target_level or "same level"
+                print(
+                    f"WARNING: {level_name}: Door at ({x}, {y}) -> {target} "
+                    f"has tile '{tile_char}' without is_door=true (teleporter won't work!)"
+                )
+
+            # For same-level teleporters, validate target position
+            if door.target_level is None:
+                tx, ty = door.target_x, door.target_y
+                if tx < 0 or tx >= level.width or ty < 0 or ty >= level.height:
+                    print(
+                        f"WARNING: {level_name}: Teleporter at ({x}, {y}) "
+                        f"has target ({tx}, {ty}) outside level bounds!"
+                    )
+                else:
+                    # Use level-specific tiles for walkability check
+                    target_tile = level.get_tile(tx, ty)
+                    target_tile_def = tiles.get(target_tile, tile_defs.DEFAULT_TILE)
+                    if not target_tile_def.walkable:
+                        print(
+                            f"WARNING: {level_name}: Teleporter at ({x}, {y}) "
+                            f"has non-walkable target ({tx}, {ty}) tile '{target_tile}'!"
+                        )
+
+        # Check for orphaned door tiles
+        for y in range(level.height):
+            for x in range(level.width):
+                tile_char = level.get_tile(x, y)
+                tile_def = tiles.get(tile_char, tile_defs.DEFAULT_TILE)
+                if tile_def.is_door and (x, y) not in level.doors:
+                    print(
+                        f"WARNING: {level_name}: Door tile '{tile_char}' at ({x}, {y}) "
+                        f"has no entry in level.json (no destination!)"
+                    )
 
     def _parse_tiles_json(
         self, data: dict[str, object]
