@@ -44,8 +44,8 @@ class TerminalUI:
 
     def _get_viewport(self) -> Viewport:
         """Get viewport sized to current terminal dimensions."""
-        # Reserve lines for status bar, mic level, controls
-        reserved_lines = 6
+        # Reserve lines for status bar, mic level
+        reserved_lines = 4
         height = max(10, self.term.height - reserved_lines)
         width = max(20, self.term.width)
         return Viewport(width=width, height=height)
@@ -153,6 +153,7 @@ class TerminalUI:
         other_levels: dict[str, Level] | None = None,
         current_level: str = "main",
         show_player_table: bool = False,
+        show_help: bool = False,
     ) -> None:
         """Render the game state to the terminal."""
         # Advance animation frame based on time (not render rate)
@@ -259,12 +260,33 @@ class TerminalUI:
                 # No overlays - use pre-joined cached row directly
                 viewport_rows.append(cached_rows[vy])
 
+        # Add "Press ? for help" hint to top right corner of first row
+        help_hint_plain = "Press ? for help"
+        help_hint = f"{self.term.dim}{help_hint_plain}{self.term.normal}"
+        if viewport_rows:
+            # Position hint at the right edge using cursor movement escape sequence
+            hint_col = viewport.width - len(help_hint_plain)
+            if hint_col > 0:
+                # Use ANSI escape sequence to move cursor to column (1-indexed)
+                move_to_col = f"\033[{hint_col}G"
+                viewport_rows[0] = viewport_rows[0] + move_to_col + help_hint
+
         # Overlay player table popup if active
         if show_player_table:
             popup_lines = self._render_player_table_popup(
                 players, local_player_id, viewport.height
             )
             for popup_x, popup_y, line_content in popup_lines:
+                if 0 <= popup_y < len(viewport_rows):
+                    # Position popup at popup_x by adding left padding
+                    left_pad = " " * max(0, popup_x)
+                    positioned_line = left_pad + line_content
+                    viewport_rows[popup_y] = positioned_line.ljust(viewport.width)
+
+        # Overlay help popup if active
+        if show_help:
+            help_popup_lines = self._render_help_popup(viewport.height)
+            for popup_x, popup_y, line_content in help_popup_lines:
                 if 0 <= popup_y < len(viewport_rows):
                     # Position popup at popup_x by adding left padding
                     left_pad = " " * max(0, popup_x)
@@ -296,12 +318,6 @@ class TerminalUI:
         red_part = self.term.red("#" * max(0, level_chars - 18))
         padding = " " * (20 - level_chars)
         output.append(f"Mic: [{green_part}{yellow_part}{red_part}{padding}]{clear_eol}")
-
-        # Controls
-        output.append(clear_eol)
-        output.append(
-            f"Controls: WASD/HJKL/Arrows=Move, M=Mute, N=Names, Tab=Players, Q=Quit{clear_eol}"
-        )
 
         # Clear any remaining lines from previous frame
         output.append(str(self.term.clear_eos))
@@ -593,6 +609,81 @@ class TerminalUI:
                 overlays.append(
                     (start_x, start_y + 3 + i, str(self.term.white(padded)))
                 )
+
+        # Bottom border
+        bottom_border = "╰" + "─" * (popup_width - 2) + "╯"
+        overlays.append(
+            (
+                start_x,
+                start_y + 3 + len(rows),
+                str(self.term.bold_white(bottom_border)),
+            )
+        )
+
+        return overlays
+
+    def _render_help_popup(
+        self,
+        viewport_height: int,
+    ) -> list[tuple[int, int, str]]:
+        """Render a centered help popup showing controls.
+
+        Returns a list of (x, y, line_content) tuples for overlay onto viewport.
+        Popup is centered in the terminal.
+        """
+        # Define controls
+        controls = [
+            ("WASD / HJKL / Arrows", "Move"),
+            ("M", "Toggle mute"),
+            ("N", "Toggle player names"),
+            ("Tab", "Show players list"),
+            ("Q", "Quit"),
+            ("?", "Close this help"),
+        ]
+
+        # Build table content
+        header = "  Controls"
+        rows: list[str] = []
+
+        for key, description in controls:
+            rows.append(f"  {key:<22} {description}")
+
+        # Calculate popup dimensions
+        content_width = max(len(header), max((len(r) for r in rows), default=0))
+        popup_width = content_width + 4  # 2 chars padding each side
+        popup_height = len(rows) + 4  # header + separator + rows + top/bottom border
+
+        # Center the popup in the terminal
+        start_x = (self.term.width - popup_width) // 2
+        start_y = (self.term.height - popup_height) // 2
+
+        # Ensure popup fits within viewport area
+        if start_x < 0:
+            start_x = 0
+        if start_y < 0:
+            start_y = 0
+        if start_y + popup_height > viewport_height:
+            start_y = max(0, viewport_height - popup_height)
+
+        overlays: list[tuple[int, int, str]] = []
+
+        # Top border
+        top_border = "╭" + "─" * (popup_width - 2) + "╮"
+        overlays.append((start_x, start_y, str(self.term.bold_white(top_border))))
+
+        # Header row
+        header_line = "│ " + header.ljust(popup_width - 4) + " │"
+        overlays.append((start_x, start_y + 1, str(self.term.bold_white(header_line))))
+
+        # Separator
+        separator = "─" * (popup_width - 2)
+        sep_line = "├" + separator + "┤"
+        overlays.append((start_x, start_y + 2, str(self.term.white(sep_line))))
+
+        # Control rows
+        for i, row in enumerate(rows):
+            padded = "│ " + row.ljust(popup_width - 4) + " │"
+            overlays.append((start_x, start_y + 3 + i, str(self.term.white(padded))))
 
         # Bottom border
         bottom_border = "╰" + "─" * (popup_width - 2) + "╯"

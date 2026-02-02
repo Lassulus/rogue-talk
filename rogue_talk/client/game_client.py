@@ -62,6 +62,7 @@ from ..common.protocol import (
 from .identity import Identity, load_or_create_identity
 from .input_handler import (
     get_movement,
+    is_help_key,
     is_mute_key,
     is_player_table_key,
     is_quit_key,
@@ -104,6 +105,7 @@ class GameClient:
         self.is_muted: bool = False
         self.show_player_names: bool = False
         self.show_player_table: bool = False
+        self.show_help: bool = False
         self.players: list[PlayerInfo] = []
         # TCP connection (only used for signaling)
         self.reader: StreamReader | None = None
@@ -947,6 +949,11 @@ class GameClient:
             self._needs_render = True
             return
 
+        if is_help_key(key):
+            self.show_help = not self.show_help
+            self._needs_render = True
+            return
+
         movement = get_movement(key)
         if movement and self.webrtc_connected and self.level and self._position_queue:
             # Rate limit movement (max 1 tile per tick interval)
@@ -1015,6 +1022,7 @@ class GameClient:
             self.other_levels,
             self.current_level,
             self.show_player_table,
+            self.show_help,
         )
 
     async def _start_audio(self) -> None:

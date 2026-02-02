@@ -52,3 +52,8 @@ def is_show_names_key(key: Keystroke) -> bool:
 def is_player_table_key(key: Keystroke) -> bool:
     """Check if key is the player table toggle (Tab)."""
     return key.name == "KEY_TAB"
+
+
+def is_help_key(key: Keystroke) -> bool:
+    """Check if key is the help toggle (?)."""
+    return str(key) == "?"
