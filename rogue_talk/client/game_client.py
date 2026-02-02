@@ -103,7 +103,7 @@ class GameClient:
         self.level: Level | None = None
         self.current_level: str = "main"
         self.is_muted: bool = False
-        self.show_player_names: bool = False
+        self.show_player_names: bool = True
         self.show_player_table: bool = False
         self.show_help: bool = False
         self.players: list[PlayerInfo] = []
