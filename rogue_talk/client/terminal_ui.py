@@ -555,7 +555,7 @@ class TerminalUI:
         Popup is centered in the terminal.
         """
         # Build table content
-        header = "  Name              Level       Position  "
+        header = "  Name              Level       Position      Ping"
         separator = "─" * len(header)
         rows: list[str] = []
 
@@ -563,8 +563,9 @@ class TerminalUI:
             marker = ">" if p.player_id == local_player_id else " "
             name = p.name[:16].ljust(16)
             level_name = p.level[:10].ljust(10)
-            pos = f"({p.x}, {p.y})"
-            rows.append(f"{marker} {name}  {level_name}  {pos}")
+            pos = f"({p.x}, {p.y})".ljust(12)
+            ping = f"{p.ping_ms}ms" if p.ping_ms > 0 else "-"
+            rows.append(f"{marker} {name}  {level_name}  {pos}  {ping}")
 
         # Calculate popup dimensions
         content_width = max(len(header), max((len(r) for r in rows), default=0))

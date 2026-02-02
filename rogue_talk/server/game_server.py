@@ -1076,7 +1076,7 @@ class GameServer:
     async def _ping_loop(
         self, player: Player, connection_closed: asyncio.Event
     ) -> None:
-        """Send periodic pings to check if client is alive."""
+        """Send periodic pings to check if client is alive and measure RTT."""
         while True:
             await asyncio.sleep(PING_INTERVAL)
 
@@ -1088,6 +1088,9 @@ class GameServer:
                 )
                 connection_closed.set()
                 return
+
+            # Record time before sending ping (for RTT measurement)
+            player.last_ping_sent_time = time.monotonic()
 
             # Send ping via data channel
             if player.webrtc_connected:
@@ -1218,7 +1221,12 @@ class GameServer:
             await self._broadcast_world_state()
 
         elif msg_type == MessageType.PONG:
-            player.last_pong_time = time.monotonic()
+            now = time.monotonic()
+            player.last_pong_time = now
+            # Calculate RTT if we have a valid ping send time
+            if player.last_ping_sent_time > 0:
+                rtt_seconds = now - player.last_ping_sent_time
+                player.ping_ms = int(rtt_seconds * 1000)
 
         elif msg_type == MessageType.WEBRTC_ANSWER:
             # Handle renegotiation answer from client
@@ -1235,7 +1243,7 @@ class GameServer:
     async def _send_world_state(self, player: Player) -> None:
         """Send current world state to a specific player via data channel."""
         players_info = [
-            PlayerInfo(p.id, p.x, p.y, p.is_muted, p.name, p.current_level)
+            PlayerInfo(p.id, p.x, p.y, p.is_muted, p.name, p.current_level, p.ping_ms)
             for p in self.players.values()
         ]
         await self._send_to_player(
@@ -1247,7 +1255,7 @@ class GameServer:
     async def _broadcast_world_state(self) -> None:
         """Broadcast world state to all players via data channels."""
         players_info = [
-            PlayerInfo(p.id, p.x, p.y, p.is_muted, p.name, p.current_level)
+            PlayerInfo(p.id, p.x, p.y, p.is_muted, p.name, p.current_level, p.ping_ms)
             for p in self.players.values()
         ]
         payload = serialize_world_state(players_info)

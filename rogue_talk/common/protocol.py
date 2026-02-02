@@ -43,6 +43,7 @@ class PlayerInfo:
     is_muted: bool
     name: str
     level: str
+    ping_ms: int = 0  # RTT in milliseconds, 0 = unknown
 
 
 @dataclass
@@ -145,13 +146,14 @@ def serialize_world_state(players: list[PlayerInfo]) -> bytes:
         name_bytes = p.name.encode("utf-8")
         level_bytes = p.level.encode("utf-8")
         result += struct.pack(
-            ">IHHBIB",
+            ">IHHBIBH",
             p.player_id,
             p.x,
             p.y,
             1 if p.is_muted else 0,
             len(name_bytes),
             len(level_bytes),
+            p.ping_ms,
         )
         result += name_bytes
         result += level_bytes
@@ -164,15 +166,17 @@ def deserialize_world_state(data: bytes) -> WorldState:
     offset += 4
     players = []
     for _ in range(num_players):
-        player_id, x, y, is_muted, name_len, level_len = struct.unpack(
-            ">IHHBIB", data[offset : offset + 14]
+        player_id, x, y, is_muted, name_len, level_len, ping_ms = struct.unpack(
+            ">IHHBIBH", data[offset : offset + 16]
         )
-        offset += 14
+        offset += 16
         name = data[offset : offset + name_len].decode("utf-8")
         offset += name_len
         level = data[offset : offset + level_len].decode("utf-8")
         offset += level_len
-        players.append(PlayerInfo(player_id, x, y, bool(is_muted), name, level))
+        players.append(
+            PlayerInfo(player_id, x, y, bool(is_muted), name, level, ping_ms)
+        )
     return WorldState(players)
 
 
