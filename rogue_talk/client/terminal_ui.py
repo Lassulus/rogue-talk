@@ -44,8 +44,8 @@ class TerminalUI:
 
     def _get_viewport(self) -> Viewport:
         """Get viewport sized to current terminal dimensions."""
-        # Reserve lines for status bar, mic level, player list, controls
-        reserved_lines = 10
+        # Reserve lines for status bar, mic level, controls
+        reserved_lines = 6
         height = max(10, self.term.height - reserved_lines)
         width = max(20, self.term.width)
         return Viewport(width=width, height=height)
@@ -152,6 +152,7 @@ class TerminalUI:
         show_player_names: bool = False,
         other_levels: dict[str, Level] | None = None,
         current_level: str = "main",
+        show_player_table: bool = False,
     ) -> None:
         """Render the game state to the terminal."""
         # Advance animation frame based on time (not render rate)
@@ -244,16 +245,35 @@ class TerminalUI:
             overlays_by_row[vy].append((vx, char))
 
         clear_eol = str(self.term.clear_eol)
+
+        # Build viewport rows first
+        viewport_rows: list[str] = []
         for vy in range(viewport.height):
             if vy in overlays_by_row:
                 # This row has overlays - need to modify
                 row_chars = list(cached_map[vy])
                 for vx, char in overlays_by_row[vy]:
                     row_chars[vx] = char
-                output.append("".join(row_chars) + clear_eol)
+                viewport_rows.append("".join(row_chars))
             else:
                 # No overlays - use pre-joined cached row directly
-                output.append(cached_rows[vy] + clear_eol)
+                viewport_rows.append(cached_rows[vy])
+
+        # Overlay player table popup if active
+        if show_player_table:
+            popup_lines = self._render_player_table_popup(
+                players, local_player_id, viewport.height
+            )
+            for popup_x, popup_y, line_content in popup_lines:
+                if 0 <= popup_y < len(viewport_rows):
+                    # Position popup at popup_x by adding left padding
+                    left_pad = " " * max(0, popup_x)
+                    positioned_line = left_pad + line_content
+                    viewport_rows[popup_y] = positioned_line.ljust(viewport.width)
+
+        # Add viewport rows to output
+        for viewport_row in viewport_rows:
+            output.append(viewport_row + clear_eol)
 
         # Status bar
         clear_eol = str(self.term.clear_eol)
@@ -277,18 +297,10 @@ class TerminalUI:
         padding = " " * (20 - level_chars)
         output.append(f"Mic: [{green_part}{yellow_part}{red_part}{padding}]{clear_eol}")
 
-        # Player list
-        output.append(clear_eol)
-        output.append("Players:" + clear_eol)
-        for p in players:
-            marker = ">" if p.player_id == local_player_id else " "
-            muted = " (muted)" if p.is_muted else ""
-            output.append(f"  {marker} {p.name} at ({p.x}, {p.y}){muted}{clear_eol}")
-
         # Controls
         output.append(clear_eol)
         output.append(
-            f"Controls: WASD/HJKL/Arrows=Move, M=Mute, Tab=Names, Q=Quit{clear_eol}"
+            f"Controls: WASD/HJKL/Arrows=Move, M=Mute, N=Names, Tab=Players, Q=Quit{clear_eol}"
         )
 
         # Clear any remaining lines from previous frame
@@ -514,6 +526,85 @@ class TerminalUI:
 
                     # Render with magenta tint (portal view)
                     overlays[(vx, vy)] = str(self.term.magenta("@"))
+
+    def _render_player_table_popup(
+        self,
+        players: list[PlayerInfo],
+        local_player_id: int,
+        viewport_height: int,
+    ) -> list[tuple[int, int, str]]:
+        """Render a centered popup showing player table.
+
+        Returns a list of (x, y, line_content) tuples for overlay onto viewport.
+        Popup is centered in the terminal.
+        """
+        # Build table content
+        header = "  Name              Level       Position  "
+        separator = "─" * len(header)
+        rows: list[str] = []
+
+        for p in players:
+            marker = ">" if p.player_id == local_player_id else " "
+            name = p.name[:16].ljust(16)
+            level_name = p.level[:10].ljust(10)
+            pos = f"({p.x}, {p.y})"
+            rows.append(f"{marker} {name}  {level_name}  {pos}")
+
+        # Calculate popup dimensions
+        content_width = max(len(header), max((len(r) for r in rows), default=0))
+        popup_width = content_width + 4  # 2 chars padding each side
+        popup_height = len(rows) + 4  # header + separator + rows + top/bottom border
+
+        # Center the popup in the terminal
+        start_x = (self.term.width - popup_width) // 2
+        start_y = (self.term.height - popup_height) // 2
+
+        # Ensure popup fits within viewport area
+        if start_x < 0:
+            start_x = 0
+        if start_y < 0:
+            start_y = 0
+        if start_y + popup_height > viewport_height:
+            start_y = max(0, viewport_height - popup_height)
+
+        overlays: list[tuple[int, int, str]] = []
+
+        # Top border
+        top_border = "╭" + "─" * (popup_width - 2) + "╮"
+        overlays.append((start_x, start_y, str(self.term.bold_white(top_border))))
+
+        # Header row
+        header_line = "│ " + header.ljust(popup_width - 4) + " │"
+        overlays.append((start_x, start_y + 1, str(self.term.bold_white(header_line))))
+
+        # Separator
+        sep_line = "├" + separator.ljust(popup_width - 2, "─") + "┤"
+        overlays.append((start_x, start_y + 2, str(self.term.white(sep_line))))
+
+        # Player rows
+        for i, row in enumerate(rows):
+            padded = "│ " + row.ljust(popup_width - 4) + " │"
+            if rows[i].startswith(">"):
+                # Highlight local player
+                overlays.append(
+                    (start_x, start_y + 3 + i, str(self.term.bold_green(padded)))
+                )
+            else:
+                overlays.append(
+                    (start_x, start_y + 3 + i, str(self.term.white(padded)))
+                )
+
+        # Bottom border
+        bottom_border = "╰" + "─" * (popup_width - 2) + "╯"
+        overlays.append(
+            (
+                start_x,
+                start_y + 3 + len(rows),
+                str(self.term.bold_white(bottom_border)),
+            )
+        )
+
+        return overlays
 
     def _get_color_fn(self, color_name: str) -> str:
         """Get color escape sequence for a color name or 256-color code."""

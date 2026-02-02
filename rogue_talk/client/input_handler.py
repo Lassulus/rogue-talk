@@ -45,5 +45,10 @@ def is_quit_key(key: Keystroke) -> bool:
 
 
 def is_show_names_key(key: Keystroke) -> bool:
-    """Check if key is the show names toggle (Tab)."""
+    """Check if key is the show names toggle (N)."""
+    return str(key).lower() == "n"
+
+
+def is_player_table_key(key: Keystroke) -> bool:
+    """Check if key is the player table toggle (Tab)."""
     return key.name == "KEY_TAB"
