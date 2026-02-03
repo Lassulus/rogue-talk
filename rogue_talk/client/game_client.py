@@ -122,6 +122,8 @@ class GameClient:
         self.show_help: bool = False
         self.show_logs: bool = False
         self.log_buffer: LogBuffer | None = None
+        self._log_scroll_offset: int = 0  # Vertical: 0 = showing most recent
+        self._log_scroll_x: int = 0  # Horizontal scroll offset
         # Interaction system
         self._interact_pending_time: float | None = None
         self._interact_lines: list[str] | None = None
@@ -1090,8 +1092,31 @@ class GameClient:
 
         if is_log_key(key):
             self.show_logs = not self.show_logs
+            if not self.show_logs:
+                self._log_scroll_offset = 0  # Reset scroll when closing
+                self._log_scroll_x = 0
             self._needs_render = True
             return
+
+        # Handle scrolling in log view
+        if self.show_logs and self.log_buffer:
+            if key.name == "KEY_UP":
+                max_offset = max(0, len(self.log_buffer.get_entries()) - 5)
+                self._log_scroll_offset = min(self._log_scroll_offset + 1, max_offset)
+                self._needs_render = True
+                return
+            elif key.name == "KEY_DOWN":
+                self._log_scroll_offset = max(0, self._log_scroll_offset - 1)
+                self._needs_render = True
+                return
+            elif key.name == "KEY_RIGHT":
+                self._log_scroll_x += 20
+                self._needs_render = True
+                return
+            elif key.name == "KEY_LEFT":
+                self._log_scroll_x = max(0, self._log_scroll_x - 20)
+                self._needs_render = True
+                return
 
         # Handle interact key (space)
         if is_interact_key(key):
@@ -1238,6 +1263,8 @@ class GameClient:
             interact_has_more,
             self.show_logs,
             self.log_buffer,
+            self._log_scroll_offset,
+            self._log_scroll_x,
         )
 
     async def _start_audio(self) -> None:

@@ -159,6 +159,8 @@ class TerminalUI:
         interact_has_more: bool = False,
         show_logs: bool = False,
         log_buffer: LogBuffer | None = None,
+        log_scroll_offset: int = 0,
+        log_scroll_x: int = 0,
     ) -> None:
         """Render the game state to the terminal."""
         # Advance animation frame based on time (not render rate)
@@ -311,7 +313,9 @@ class TerminalUI:
 
         # Overlay log popup if active
         if show_logs and log_buffer:
-            log_popup_lines = self._render_log_popup(log_buffer, viewport.height)
+            log_popup_lines = self._render_log_popup(
+                log_buffer, viewport.height, log_scroll_offset, log_scroll_x
+            )
             for popup_x, popup_y, line_content in log_popup_lines:
                 if 0 <= popup_y < len(viewport_rows):
                     left_pad = " " * max(0, popup_x)
@@ -1052,20 +1056,22 @@ class TerminalUI:
         self,
         log_buffer: LogBuffer,
         viewport_height: int,
+        scroll_offset: int = 0,
+        scroll_x: int = 0,
     ) -> list[tuple[int, int, str]]:
         """Render a log viewer popup showing recent log entries.
 
         Returns a list of (x, y, line_content) tuples for overlay onto viewport.
         Popup takes up most of the screen.
         """
-        # Calculate popup dimensions (80% of screen)
-        popup_width = min(self.term.width - 4, 100)
-        popup_height = min(viewport_height - 2, 30)
+        # Calculate popup dimensions (nearly full screen)
+        popup_width = self.term.width - 4
+        popup_height = viewport_height - 2
         content_width = popup_width - 4  # 2 chars padding each side
 
         # Center the popup
-        start_x = (self.term.width - popup_width) // 2
-        start_y = (viewport_height - popup_height) // 2
+        start_x = 2
+        start_y = 1
 
         # Ensure popup fits
         if start_x < 0:
@@ -1085,7 +1091,15 @@ class TerminalUI:
 
         # Get log entries that fit in the popup (leave room for borders)
         content_height = popup_height - 2  # Top and bottom borders
-        entries = log_buffer.get_entries(content_height)
+        all_entries = log_buffer.get_entries()
+
+        # Apply scroll offset (0 = most recent at bottom, higher = scroll up to older)
+        if scroll_offset > 0 and len(all_entries) > content_height:
+            end_idx = len(all_entries) - scroll_offset
+            start_idx = max(0, end_idx - content_height)
+            entries = all_entries[start_idx:end_idx]
+        else:
+            entries = all_entries[-content_height:] if all_entries else []
 
         # Render log entries (most recent at bottom, empty lines at top if needed)
         empty_lines = content_height - len(entries)
@@ -1094,16 +1108,11 @@ class TerminalUI:
             if entry_idx >= 0 and entry_idx < len(entries):
                 entry = entries[entry_idx]
 
-                # Truncate message to fit
-                prefix = f"[{entry.level[0]}] {entry.name}: "
-                max_msg_len = content_width - len(prefix)
-                msg = (
-                    entry.message[:max_msg_len]
-                    if len(entry.message) > max_msg_len
-                    else entry.message
-                )
-                line_text = prefix + msg
-                line_text = line_text[:content_width].ljust(content_width)
+                # Build full line text, then apply horizontal scroll
+                full_line = f"[{entry.level[0]}] {entry.name}: {entry.message}"
+                # Apply horizontal scroll and take content_width chars
+                scrolled = full_line[scroll_x:] if scroll_x < len(full_line) else ""
+                line_text = scrolled[:content_width].ljust(content_width)
 
                 # Apply color based on log level
                 if entry.level == "DEBUG":
