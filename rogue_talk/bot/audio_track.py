@@ -12,6 +12,7 @@ import numpy as np
 import numpy.typing as npt
 from aiortc import MediaStreamTrack
 
+from ..audio.pcm import float32_to_int16
 from ..common.constants import FRAME_SIZE, SAMPLE_RATE
 from .audio import AudioSource
 
@@ -122,7 +123,7 @@ class BotAudioCaptureTrack(MediaStreamTrack):
                 pcm_data = pcm_data[: self._frame_size]
 
             # Convert to int16 for av.AudioFrame (mono packed format)
-            pcm_int16 = np.clip(pcm_data * 32768, -32768, 32767).astype("<i2")
+            pcm_int16 = float32_to_int16(pcm_data)
 
             # Create AudioFrame with manual plane update
             frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm_int16))

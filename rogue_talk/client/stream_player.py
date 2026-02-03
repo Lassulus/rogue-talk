@@ -15,6 +15,8 @@ import numpy as np
 import numpy.typing as npt
 
 from ..audio.backend import AudioOutputStream, create_output_stream
+from ..audio.pcm import resample as pcm_resample
+from ..audio.pcm import to_float32
 from ..common.constants import FRAME_SIZE, SAMPLE_RATE
 
 _logger = logging.getLogger(__name__)
@@ -275,19 +277,12 @@ class StreamPlayer:
                         # Average channels to mono
                         arr = arr.mean(axis=0)
 
-                    # Normalize based on dtype
-                    if arr.dtype == np.int16:
-                        arr = arr.astype(np.float32) / 32768.0
-                    elif arr.dtype == np.int32:
-                        arr = arr.astype(np.float32) / 2147483648.0
-                    elif arr.dtype == np.float64:
-                        arr = arr.astype(np.float32)
-                    elif arr.dtype != np.float32:
-                        arr = arr.astype(np.float32)
+                    # Normalize to float32
+                    arr = to_float32(arr)
 
                     # Resample if needed
                     if framerate != SAMPLE_RATE:
-                        arr = self._resample(arr, framerate, SAMPLE_RATE)
+                        arr = pcm_resample(arr, framerate, SAMPLE_RATE)
 
                     # Put in queue with blocking (backpressure to HTTP reader)
                     stream.frame_count += 1
@@ -310,23 +305,6 @@ class StreamPlayer:
         finally:
             if container is not None:
                 container.close()
-
-    def _resample(
-        self,
-        audio: npt.NDArray[np.float32],
-        src_rate: int,
-        dst_rate: int,
-    ) -> npt.NDArray[np.float32]:
-        """Simple linear resampling."""
-        if src_rate == dst_rate:
-            return audio
-
-        ratio = dst_rate / src_rate
-        new_length = int(len(audio) * ratio)
-        old_indices = np.arange(len(audio))
-        new_indices = np.linspace(0, len(audio) - 1, new_length)
-        resampled = np.interp(new_indices, old_indices, audio)
-        return resampled.astype(np.float32)
 
     def _get_mixed_frame(self) -> npt.NDArray[np.float32]:
         """Get the next frame of mixed stream audio.

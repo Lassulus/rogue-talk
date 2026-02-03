@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
+from ..audio.pcm import resample as pcm_resample
+from ..audio.pcm import to_float32
 from ..common.constants import FRAME_SIZE, SAMPLE_RATE
 
 
@@ -78,12 +80,10 @@ class FileAudioSource(AudioSource):
             audio = (audio - 128) / 128.0
         elif sample_width == 2:
             # 16-bit signed
-            audio = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32)
-            audio = audio / 32768.0
+            audio = to_float32(np.frombuffer(raw_data, dtype=np.int16))
         elif sample_width == 4:
             # 32-bit signed
-            audio = np.frombuffer(raw_data, dtype=np.int32).astype(np.float32)
-            audio = audio / 2147483648.0
+            audio = to_float32(np.frombuffer(raw_data, dtype=np.int32))
         else:
             raise ValueError(f"Unsupported sample width: {sample_width}")
 
@@ -95,7 +95,7 @@ class FileAudioSource(AudioSource):
 
         # Resample if needed
         if framerate != SAMPLE_RATE:
-            audio = self._resample(audio, framerate, SAMPLE_RATE)
+            audio = pcm_resample(audio, framerate, SAMPLE_RATE)
 
         self._samples = audio.astype(np.float32)
 
@@ -144,45 +144,15 @@ class FileAudioSource(AudioSource):
             # Convert to mono by averaging channels
             audio = audio.mean(axis=0)
 
-        # Normalize based on dtype
-        if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
-        elif audio.dtype == np.int32:
-            audio = audio.astype(np.float32) / 2147483648.0
-        elif audio.dtype == np.float64:
-            audio = audio.astype(np.float32)
-        elif audio.dtype != np.float32:
-            # Assume it's already normalized or convert as float
-            audio = audio.astype(np.float32)
+        # Normalize to float32
+        audio = to_float32(audio)
 
         # Resample if needed
         framerate = audio_stream.sample_rate
         if framerate != SAMPLE_RATE:
-            audio = self._resample(audio, framerate, SAMPLE_RATE)
+            audio = pcm_resample(audio, framerate, SAMPLE_RATE)
 
         self._samples = audio.astype(np.float32)
-
-    def _resample(
-        self,
-        audio: npt.NDArray[np.float32],
-        src_rate: int,
-        dst_rate: int,
-    ) -> npt.NDArray[np.float32]:
-        """Simple linear resampling."""
-        if src_rate == dst_rate:
-            return audio
-
-        # Calculate the ratio and new length
-        ratio = dst_rate / src_rate
-        new_length = int(len(audio) * ratio)
-
-        # Create new time indices
-        old_indices = np.arange(len(audio))
-        new_indices = np.linspace(0, len(audio) - 1, new_length)
-
-        # Linear interpolation
-        resampled = np.interp(new_indices, old_indices, audio)
-        return resampled.astype(np.float32)
 
     async def get_samples(self) -> npt.NDArray[np.float32] | None:
         """Get the next frame of audio samples."""
@@ -242,29 +212,12 @@ class PCMAudioSource(AudioSource):
         """
         # Resample if needed
         if self._sample_rate != SAMPLE_RATE:
-            samples = self._resample(samples, self._sample_rate, SAMPLE_RATE)
+            samples = pcm_resample(samples, self._sample_rate, SAMPLE_RATE)
 
         try:
             self._queue.put_nowait(samples.astype(np.float32))
         except asyncio.QueueFull:
             pass  # Drop if queue is full
-
-    def _resample(
-        self,
-        audio: npt.NDArray[np.float32],
-        src_rate: int,
-        dst_rate: int,
-    ) -> npt.NDArray[np.float32]:
-        """Simple linear resampling."""
-        if src_rate == dst_rate:
-            return audio
-
-        ratio = dst_rate / src_rate
-        new_length = int(len(audio) * ratio)
-        old_indices = np.arange(len(audio))
-        new_indices = np.linspace(0, len(audio) - 1, new_length)
-        resampled = np.interp(new_indices, old_indices, audio)
-        return resampled.astype(np.float32)
 
     def finish(self) -> None:
         """Mark the source as finished (no more samples will be added)."""

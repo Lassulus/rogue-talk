@@ -14,6 +14,7 @@ import numpy.typing as npt
 from aiortc import MediaStreamTrack
 
 from ..common.constants import CHANNELS, FRAME_SIZE, SAMPLE_RATE
+from .pcm import float32_to_int16, to_float32
 
 # Debug logging to file (doesn't interfere with terminal UI)
 logger = logging.getLogger(__name__)
@@ -76,8 +77,7 @@ class AudioCaptureTrack(MediaStreamTrack):
                 raise
 
             # Convert to int16 for av.AudioFrame (mono packed format)
-            # Use little-endian explicitly to match av.AudioFormat s16
-            pcm_int16 = np.clip(pcm_data * 32768, -32768, 32767).astype("<i2")
+            pcm_int16 = float32_to_int16(pcm_data)
 
             # Create AudioFrame with manual plane update (most reliable method)
             frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm_int16))
@@ -183,12 +183,7 @@ class AudioPlaybackTrack:
                         pcm_data = pcm_data.flatten()
 
                     # Convert to float32 and normalize
-                    if pcm_data.dtype == np.int16:
-                        pcm_float = pcm_data.astype(np.float32) / 32768.0
-                    elif pcm_data.dtype == np.int32:
-                        pcm_float = pcm_data.astype(np.float32) / 2147483648.0
-                    else:
-                        pcm_float = pcm_data.astype(np.float32)
+                    pcm_float = to_float32(pcm_data)
 
                     self._frame_count += 1
                     try:
@@ -274,12 +269,7 @@ class ServerAudioRelay:
                         pcm_data = pcm_data.flatten()
 
                     # Convert to float32 and normalize
-                    if pcm_data.dtype == np.int16:
-                        pcm_float = pcm_data.astype(np.float32) / 32768.0
-                    elif pcm_data.dtype == np.int32:
-                        pcm_float = pcm_data.astype(np.float32) / 2147483648.0
-                    else:
-                        pcm_float = pcm_data.astype(np.float32)
+                    pcm_float = to_float32(pcm_data)
 
                     self._frame_count += 1
                     try:
@@ -355,7 +345,7 @@ class ServerOutboundTrack(MediaStreamTrack):
                 raise
 
             # Convert to int16 for av.AudioFrame (mono packed format)
-            pcm_int16 = np.clip(pcm_data * 32768, -32768, 32767).astype("<i2")
+            pcm_int16 = float32_to_int16(pcm_data)
 
             # Create AudioFrame with manual plane update
             frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm_int16))

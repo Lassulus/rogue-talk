@@ -16,6 +16,7 @@ import numpy as np
 import numpy.typing as npt
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 
+from ..audio.pcm import to_float32
 from ..common.constants import AUDIO_MAX_DISTANCE, FRAME_SIZE, SAMPLE_RATE
 from ..common.crypto import generate_keypair, sign_challenge
 from ..common.protocol import (
@@ -427,12 +428,7 @@ class BotClient:
                     continue  # Silence frame
 
                 # Convert to float32 and normalize
-                if pcm_data.dtype == np.int16:
-                    pcm_float = pcm_data.astype(np.float32) / 32768.0
-                elif pcm_data.dtype == np.int32:
-                    pcm_float = pcm_data.astype(np.float32) / 2147483648.0
-                else:
-                    pcm_float = pcm_data.astype(np.float32)
+                pcm_float = to_float32(pcm_data)
 
                 pcm_float = pcm_float.flatten()
 

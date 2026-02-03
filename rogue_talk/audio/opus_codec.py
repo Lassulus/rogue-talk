@@ -9,6 +9,7 @@ import opuslib_next.api.ctl as opus_ctl
 import opuslib_next.api.encoder as opus_encoder_api
 
 from ..common.constants import CHANNELS, FRAME_SIZE, OPUS_BITRATE, SAMPLE_RATE
+from .pcm import float32_to_int16, to_float32
 
 
 class OpusEncoder:
@@ -35,7 +36,7 @@ class OpusEncoder:
     def encode(self, pcm_data: npt.NDArray[np.float32]) -> bytes:
         """Encode PCM float32 data to Opus."""
         # Convert float32 [-1.0, 1.0] to int16
-        pcm_int16 = (pcm_data * 32767).astype(np.int16)
+        pcm_int16 = float32_to_int16(pcm_data)
         result: bytes = self.encoder.encode(pcm_int16.tobytes(), FRAME_SIZE)
         return result
 
@@ -50,4 +51,4 @@ class OpusDecoder:
         """Decode Opus data to PCM float32."""
         pcm_bytes: bytes = self.decoder.decode(opus_data, FRAME_SIZE)
         pcm_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
-        return pcm_int16.astype(np.float32) / 32767.0
+        return to_float32(pcm_int16)

@@ -7,6 +7,7 @@ import numpy.typing as npt
 import soundfile as sf
 
 from ..common.constants import SAMPLE_RATE
+from .pcm import resample
 
 
 class SoundCache:
@@ -59,7 +60,7 @@ class SoundCache:
 
             # Resample if needed
             if sample_rate != SAMPLE_RATE:
-                audio = self._resample(audio, sample_rate, SAMPLE_RATE)
+                audio = resample(audio, sample_rate, SAMPLE_RATE)
 
             self._sounds[filename] = audio
             return audio
@@ -67,33 +68,3 @@ class SoundCache:
         except Exception:
             # Any error loading the file - skip silently
             return None
-
-    def _resample(
-        self,
-        audio: npt.NDArray[np.float32],
-        src_rate: int,
-        dst_rate: int,
-    ) -> npt.NDArray[np.float32]:
-        """Simple linear interpolation resampling.
-
-        Args:
-            audio: Source audio data
-            src_rate: Source sample rate
-            dst_rate: Destination sample rate
-
-        Returns:
-            Resampled audio data
-        """
-        if src_rate == dst_rate:
-            return audio
-
-        # Calculate new length
-        duration = len(audio) / src_rate
-        new_length = int(duration * dst_rate)
-
-        # Linear interpolation
-        old_indices = np.arange(len(audio))
-        new_indices = np.linspace(0, len(audio) - 1, new_length)
-        resampled = np.interp(new_indices, old_indices, audio).astype(np.float32)
-
-        return resampled

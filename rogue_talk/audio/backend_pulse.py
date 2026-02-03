@@ -16,6 +16,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .backend import AudioInputStream, AudioOutputStream
+from .pcm import to_float32
 
 _logger = logging.getLogger(__name__)
 _debug_handler = logging.FileHandler("/tmp/rogue_talk_backend.log")
@@ -243,12 +244,7 @@ class PulseInputStream(AudioInputStream):
                     )
 
                 # Normalize to float32 range [-1.0, 1.0] based on original dtype
-                if data.dtype == np.int16:
-                    data = data.astype(np.float32) / 32768.0
-                elif data.dtype == np.int32:
-                    data = data.astype(np.float32) / 2147483648.0
-                elif data.dtype != np.float32:
-                    data = data.astype(np.float32)
+                data = to_float32(data)
 
                 # Flatten to mono if needed
                 if data.ndim > 1:
