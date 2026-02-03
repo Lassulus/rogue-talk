@@ -1,6 +1,8 @@
 # Rogue-Talk
 
-Proximity-based voice chat roguelike.
+Proximity-based voice chat multiplayer roguelike.
+
+[![asciicast](https://asciinema.org/a/SxkzpnTAmGKMBo4G.svg)](https://asciinema.org/a/SxkzpnTAmGKMBo4G)
 
 ## Running
 
