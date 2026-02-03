@@ -62,3 +62,8 @@ def is_help_key(key: Keystroke) -> bool:
 def is_interact_key(key: Keystroke) -> bool:
     """Check if key is the interact key (Space)."""
     return str(key) == " "
+
+
+def is_log_key(key: Keystroke) -> bool:
+    """Check if key is the log window toggle (`)."""
+    return str(key) == "`"

@@ -74,11 +74,13 @@ from .input_handler import (
     get_movement,
     is_help_key,
     is_interact_key,
+    is_log_key,
     is_mute_key,
     is_player_table_key,
     is_quit_key,
     is_show_names_key,
 )
+from .log_buffer import LogBuffer
 from .level import Level
 from .level_cache import cache_received_files, get_cached_files
 from .level_pack import (
@@ -118,6 +120,8 @@ class GameClient:
         self.show_player_names: bool = True
         self.show_player_table: bool = False
         self.show_help: bool = False
+        self.show_logs: bool = False
+        self.log_buffer: LogBuffer | None = None
         # Interaction system
         self._interact_pending_time: float | None = None
         self._interact_lines: list[str] | None = None
@@ -1084,6 +1088,11 @@ class GameClient:
             self._needs_render = True
             return
 
+        if is_log_key(key):
+            self.show_logs = not self.show_logs
+            self._needs_render = True
+            return
+
         # Handle interact key (space)
         if is_interact_key(key):
             # If popup is showing, skip animation or advance to next line
@@ -1227,6 +1236,8 @@ class GameClient:
             self.show_help,
             interact_text,
             interact_has_more,
+            self.show_logs,
+            self.log_buffer,
         )
 
     async def _start_audio(self) -> None:

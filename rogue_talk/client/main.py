@@ -7,17 +7,26 @@ import os
 
 from ..common.constants import DEFAULT_HOST, DEFAULT_PORT
 from .game_client import GameClient
+from .log_buffer import LogBuffer
 
 
-def setup_logging(log_file: str) -> None:
-    """Configure logging to file only (console would interfere with TUI)."""
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-        ],
-    )
+def setup_logging(log_file: str | None, log_buffer: LogBuffer) -> None:
+    """Configure logging with in-memory buffer and optional file output."""
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Always add the in-memory buffer for TUI display
+    log_buffer.setLevel(logging.DEBUG)
+    root.addHandler(log_buffer)
+
+    # Optionally add file handler
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        root.addHandler(file_handler)
+
     # Suppress noisy aiortc debug logs (RTP packet spam)
     logging.getLogger("aiortc").setLevel(logging.WARNING)
     logging.getLogger("aioice").setLevel(logging.WARNING)
@@ -31,17 +40,16 @@ def main() -> None:
         "--name", default=os.environ.get("USER", "player"), help="Player name"
     )
     parser.add_argument(
-        "--log", help="Log file path (logging disabled if not specified)"
+        "--log", help="Log file path (in addition to in-memory log buffer)"
     )
     args = parser.parse_args()
 
-    if args.log:
-        setup_logging(args.log)
-    else:
-        # Suppress all logging output (no stderr spam during TUI)
-        logging.getLogger().addHandler(logging.NullHandler())
+    # Create log buffer for TUI display
+    log_buffer = LogBuffer(maxlen=200)
+    setup_logging(args.log, log_buffer)
 
     client = GameClient(args.host, args.port, args.name)
+    client.log_buffer = log_buffer
 
     async def run_client() -> None:
         if await client.connect():

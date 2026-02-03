@@ -9,6 +9,7 @@ from blessed import Terminal
 from ..common import tiles
 from ..common.protocol import PlayerInfo
 from .level import DoorInfo, Level, StreamInfo
+from .log_buffer import LogBuffer
 from .viewport import Viewport
 
 # Lighting constants - gradual fade zones
@@ -156,6 +157,8 @@ class TerminalUI:
         show_help: bool = False,
         interact_message: str | None = None,
         interact_has_more: bool = False,
+        show_logs: bool = False,
+        log_buffer: LogBuffer | None = None,
     ) -> None:
         """Render the game state to the terminal."""
         # Advance animation frame based on time (not render rate)
@@ -301,6 +304,15 @@ class TerminalUI:
                 interact_message, viewport.width, viewport.height, interact_has_more
             )
             for popup_x, popup_y, line_content in interact_popup_lines:
+                if 0 <= popup_y < len(viewport_rows):
+                    left_pad = " " * max(0, popup_x)
+                    positioned_line = left_pad + line_content
+                    viewport_rows[popup_y] = positioned_line.ljust(viewport.width)
+
+        # Overlay log popup if active
+        if show_logs and log_buffer:
+            log_popup_lines = self._render_log_popup(log_buffer, viewport.height)
+            for popup_x, popup_y, line_content in log_popup_lines:
                 if 0 <= popup_y < len(viewport_rows):
                     left_pad = " " * max(0, popup_x)
                     positioned_line = left_pad + line_content
@@ -670,6 +682,7 @@ class TerminalUI:
             ("M", "Toggle mute"),
             ("N", "Toggle player names"),
             ("Tab", "Show players list"),
+            ("`", "Show logs"),
             ("Q", "Quit"),
             ("?", "Close this help"),
         ]
@@ -1034,6 +1047,92 @@ class TerminalUI:
         else:
             # Very dim magenta (256-color: 53)
             return str(self.term.color(53)(display_char))  # type: ignore
+
+    def _render_log_popup(
+        self,
+        log_buffer: LogBuffer,
+        viewport_height: int,
+    ) -> list[tuple[int, int, str]]:
+        """Render a log viewer popup showing recent log entries.
+
+        Returns a list of (x, y, line_content) tuples for overlay onto viewport.
+        Popup takes up most of the screen.
+        """
+        # Calculate popup dimensions (80% of screen)
+        popup_width = min(self.term.width - 4, 100)
+        popup_height = min(viewport_height - 2, 30)
+        content_width = popup_width - 4  # 2 chars padding each side
+
+        # Center the popup
+        start_x = (self.term.width - popup_width) // 2
+        start_y = (viewport_height - popup_height) // 2
+
+        # Ensure popup fits
+        if start_x < 0:
+            start_x = 0
+        if start_y < 0:
+            start_y = 0
+
+        overlays: list[tuple[int, int, str]] = []
+
+        # Top border with title
+        title = " Logs (` to close) "
+        title_padding = popup_width - 2 - len(title)
+        left_pad = title_padding // 2
+        right_pad = title_padding - left_pad
+        top_border = "╭" + "─" * left_pad + title + "─" * right_pad + "╮"
+        overlays.append((start_x, start_y, str(self.term.bold_cyan(top_border))))
+
+        # Get log entries that fit in the popup (leave room for borders)
+        content_height = popup_height - 2  # Top and bottom borders
+        entries = log_buffer.get_entries(content_height)
+
+        # Render log entries (most recent at bottom, empty lines at top if needed)
+        empty_lines = content_height - len(entries)
+        for i in range(content_height):
+            entry_idx = i - empty_lines
+            if entry_idx >= 0 and entry_idx < len(entries):
+                entry = entries[entry_idx]
+
+                # Truncate message to fit
+                prefix = f"[{entry.level[0]}] {entry.name}: "
+                max_msg_len = content_width - len(prefix)
+                msg = (
+                    entry.message[:max_msg_len]
+                    if len(entry.message) > max_msg_len
+                    else entry.message
+                )
+                line_text = prefix + msg
+                line_text = line_text[:content_width].ljust(content_width)
+
+                # Apply color based on log level
+                if entry.level == "DEBUG":
+                    colored_text = str(self.term.bright_black(line_text))
+                elif entry.level == "WARNING":
+                    colored_text = str(self.term.yellow(line_text))
+                elif entry.level == "ERROR":
+                    colored_text = str(self.term.red(line_text))
+                elif entry.level == "CRITICAL":
+                    colored_text = str(self.term.bold_red(line_text))
+                else:  # INFO and others
+                    colored_text = str(self.term.white(line_text))
+                line = "│ " + colored_text + " │"
+            else:
+                # Empty line
+                line = "│ " + " " * content_width + " │"
+            overlays.append((start_x, start_y + 1 + i, str(self.term.cyan(line))))
+
+        # Bottom border
+        bottom_border = "╰" + "─" * (popup_width - 2) + "╯"
+        overlays.append(
+            (
+                start_x,
+                start_y + popup_height - 1,
+                str(self.term.bold_cyan(bottom_border)),
+            )
+        )
+
+        return overlays
 
     def cleanup(self) -> None:
         """Restore terminal state."""
