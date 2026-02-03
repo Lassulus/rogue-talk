@@ -314,9 +314,10 @@ class ServerOutboundTrack(MediaStreamTrack):
     def send_audio(self, pcm_data: npt.NDArray[np.float32]) -> None:
         """Queue audio data to send to the client.
 
-        Note: Caller is expected to pass a buffer that won't be modified after
-        this call. In practice, this is always true because the audio routing
-        loop creates a new scaled_frame for each recipient.
+        The same unscaled buffer may be shared across all recipients of a
+        source. This is safe because ``recv()`` converts to int16 via
+        ``float32_to_int16`` (a new allocation) and never mutates the
+        float32 source array.
         """
         if not self._active:
             return  # Don't queue until track is in peer connection

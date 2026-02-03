@@ -12,6 +12,7 @@ import numpy as np
 import numpy.typing as npt
 
 from ..audio.backend import AudioOutputStream, create_output_stream
+from ..common.audio import get_volume
 from ..common.constants import AUDIO_MAX_DISTANCE, FRAME_SIZE, SAMPLE_RATE
 
 if TYPE_CHECKING:
@@ -285,6 +286,19 @@ class AudioPlayback:
         with self._tracks_lock:
             self._playback_tracks.pop(player_name, None)
 
+    def _get_proximity_volume(self, player_name: str) -> float:
+        """Calculate proximity volume for a player based on positions.
+
+        Returns 1.0 if either position is unknown (before first WORLD_STATE).
+        """
+        with self._streams_lock:
+            pos = self._player_positions.get(player_name)
+            if pos is None:
+                return 1.0
+            dx = pos[0] - self._my_position[0]
+            dy = pos[1] - self._my_position[1]
+        return get_volume(dx, dy)
+
     def _get_or_create_stream(self, player_name: str) -> PlayerAudioStream | None:
         """Get existing stream or create new one for player if in range."""
         with self._streams_lock:
@@ -318,15 +332,20 @@ class AudioPlayback:
                     if pcm_data is None:
                         break
                     frame_count += 1
+
+                    # Apply client-side proximity volume
+                    volume = self._get_proximity_volume(player_name)
+                    if volume <= 0.0:
+                        continue
+
                     if frame_count % 500 == 1:
                         _logger.debug(
                             f"Received audio frame {frame_count} from {player_name}, "
-                            f"samples={len(pcm_data)}"
+                            f"samples={len(pcm_data)}, volume={volume:.2f}"
                         )
                     stream = self._get_or_create_stream(player_name)
                     if stream is not None:
-                        # Volume is always 1.0 here - server already applied distance scaling
-                        stream.feed_audio(pcm_data, 1.0)
+                        stream.feed_audio(pcm_data, volume)
                         # Log audio level periodically
                         if frame_count % 500 == 1:
                             level = float(np.abs(pcm_data).max())

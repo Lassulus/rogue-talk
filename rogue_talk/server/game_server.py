@@ -564,9 +564,8 @@ class GameServer:
                             f"Created track for {source.name} -> {recipient.name}"
                         )
 
-                    # Scale audio by volume and send
-                    scaled_frame = frame * volume
-                    track.send_audio(scaled_frame)
+                    # Send unscaled frame; client applies proximity volume
+                    track.send_audio(frame)
 
         # Remove tracks for players no longer in range
         for recipient in list(self.players.values()):
