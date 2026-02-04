@@ -45,6 +45,33 @@
                 build-system = [ self.poetry-core ];
                 doCheck = false;
               };
+              livekit = self.buildPythonPackage {
+                pname = "livekit";
+                version = "1.0.25";
+                format = "wheel";
+                src = pkgs.fetchPypi {
+                  pname = "livekit";
+                  version = "1.0.25";
+                  format = "wheel";
+                  dist = "py3";
+                  python = "py3";
+                  abi = "none";
+                  platform = "manylinux_2_28_x86_64";
+                  sha256 = "abe498700566e90c89dbbf73731f850f4b5f7d2185bac88be71a34657b51fd3a";
+                };
+                nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+                buildInputs = [
+                  pkgs.stdenv.cc.cc.lib
+                  pkgs.libva
+                ];
+                dependencies = [
+                  self.livekit-protocol
+                  self.protobuf
+                  self.numpy
+                  self.aiofiles
+                ];
+                doCheck = false;
+              };
             };
           };
 
@@ -59,12 +86,14 @@
               build-system = [ python.pkgs.setuptools ];
 
               dependencies = with python.pkgs; [
+                av
                 blessed
                 soundfile
                 opuslib_next
                 numpy
                 cryptography
-                aiortc
+                livekit-api
+                livekit
                 aiohttp
               ];
 
@@ -73,8 +102,8 @@
                   pkgs.lib.makeLibraryPath [
                     pkgs.libopus
                     pkgs.libsndfile
-                    pkgs.libvpx
                     pkgs.ffmpeg
+                    pkgs.libva
                   ]
                 }"
               ];
@@ -94,7 +123,8 @@
                 ps.opuslib_next
                 ps.numpy
                 ps.cryptography
-                ps.aiortc
+                ps.livekit-api
+                ps.livekit
                 ps.aiohttp
               ]);
               examples = ./examples;
@@ -104,8 +134,8 @@
                 pkgs.lib.makeLibraryPath [
                   pkgs.libopus
                   pkgs.libsndfile
-                  pkgs.libvpx
                   pkgs.ffmpeg
+                  pkgs.libva
                 ]
               }:$LD_LIBRARY_PATH"
               export PYTHONPATH="${./.}:$PYTHONPATH"
@@ -119,7 +149,8 @@
                 ps.opuslib_next
                 ps.numpy
                 ps.cryptography
-                ps.aiortc
+                ps.livekit-api
+                ps.livekit
                 ps.aiohttp
               ]);
               examples = ./examples;
@@ -129,8 +160,8 @@
                 pkgs.lib.makeLibraryPath [
                   pkgs.libopus
                   pkgs.libsndfile
-                  pkgs.libvpx
                   pkgs.ffmpeg
+                  pkgs.libva
                 ]
               }:$LD_LIBRARY_PATH"
               export PYTHONPATH="${./.}:$PYTHONPATH"
@@ -161,6 +192,33 @@
                 build-system = [ self.poetry-core ];
                 doCheck = false;
               };
+              livekit = self.buildPythonPackage {
+                pname = "livekit";
+                version = "1.0.25";
+                format = "wheel";
+                src = pkgs.fetchPypi {
+                  pname = "livekit";
+                  version = "1.0.25";
+                  format = "wheel";
+                  dist = "py3";
+                  python = "py3";
+                  abi = "none";
+                  platform = "manylinux_2_28_x86_64";
+                  sha256 = "abe498700566e90c89dbbf73731f850f4b5f7d2185bac88be71a34657b51fd3a";
+                };
+                nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+                buildInputs = [
+                  pkgs.stdenv.cc.cc.lib
+                  pkgs.libva
+                ];
+                dependencies = [
+                  self.livekit-protocol
+                  self.protobuf
+                  self.numpy
+                  self.aiofiles
+                ];
+                doCheck = false;
+              };
             };
           };
         in
@@ -174,7 +232,8 @@
                 ps.numpy
                 ps.cryptography
                 ps.mypy
-                ps.aiortc
+                ps.livekit-api
+                ps.livekit
                 ps.aiohttp
                 # Test dependencies
                 ps.pytest
@@ -184,12 +243,11 @@
               ]))
               pkgs.libopus
               pkgs.libsndfile
-              pkgs.libvpx
               pkgs.ffmpeg
             ];
 
             shellHook = ''
-              export LD_LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libsndfile}/lib:${pkgs.libvpx}/lib:${pkgs.ffmpeg}/lib:$LD_LIBRARY_PATH"
+              export LD_LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libsndfile}/lib:${pkgs.ffmpeg}/lib:${pkgs.libva}/lib:$LD_LIBRARY_PATH"
             '';
           };
         }
@@ -206,7 +264,6 @@
                 ps.mypy
                 ps.numpy
                 ps.blessed
-                ps.aiortc
                 ps.aiohttp
               ])
             }/bin/mypy "$@"
@@ -245,6 +302,33 @@
                 build-system = [ self.poetry-core ];
                 doCheck = false;
               };
+              livekit = self.buildPythonPackage {
+                pname = "livekit";
+                version = "1.0.25";
+                format = "wheel";
+                src = pkgs.fetchPypi {
+                  pname = "livekit";
+                  version = "1.0.25";
+                  format = "wheel";
+                  dist = "py3";
+                  python = "py3";
+                  abi = "none";
+                  platform = "manylinux_2_28_x86_64";
+                  sha256 = "abe498700566e90c89dbbf73731f850f4b5f7d2185bac88be71a34657b51fd3a";
+                };
+                nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+                buildInputs = [
+                  pkgs.stdenv.cc.cc.lib
+                  pkgs.libva
+                ];
+                dependencies = [
+                  self.livekit-protocol
+                  self.protobuf
+                  self.numpy
+                  self.aiofiles
+                ];
+                doCheck = false;
+              };
             };
           };
           mypy = pkgs.writeShellScriptBin "mypy" ''
@@ -253,7 +337,6 @@
                 ps.mypy
                 ps.numpy
                 ps.blessed
-                ps.aiortc
                 ps.aiohttp
               ])
             }/bin/mypy "$@"
@@ -274,7 +357,8 @@
             ps.opuslib_next
             ps.numpy
             ps.cryptography
-            ps.aiortc
+            ps.livekit-api
+            ps.livekit
             ps.aiohttp
             ps.pytest
             ps.pytest-asyncio
@@ -285,7 +369,7 @@
         {
           formatting = treefmtEval.config.build.check self;
           pytest = pkgs.runCommand "pytest" { nativeBuildInputs = [ pythonEnv ]; } ''
-            export LD_LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libsndfile}/lib:${pkgs.libvpx}/lib:${pkgs.ffmpeg}/lib"
+            export LD_LIBRARY_PATH="${pkgs.libopus}/lib:${pkgs.libsndfile}/lib:${pkgs.ffmpeg}/lib"
             cd ${self}
             pytest
             touch $out
@@ -316,24 +400,57 @@
               default = true;
               description = "Open the firewall port";
             };
+            livekitKeyFile = lib.mkOption {
+              type = lib.types.path;
+              description = "Path to LiveKit key file (format: 'key: secret')";
+            };
+            livekitApiKeyFile = lib.mkOption {
+              type = lib.types.path;
+              description = "Path to file containing the LiveKit API key";
+            };
+            livekitApiSecretFile = lib.mkOption {
+              type = lib.types.path;
+              description = "Path to file containing the LiveKit API secret";
+            };
           };
 
           config = lib.mkIf cfg.enable {
+            services.livekit = {
+              enable = true;
+              openFirewall = true;
+              keyFile = cfg.livekitKeyFile;
+            };
+
             systemd.services.rogue-talk-server = {
               description = "Rogue-Talk Server";
               wantedBy = [ "multi-user.target" ];
-              after = [ "network.target" ];
+              after = [
+                "network.target"
+                "livekit-server.service"
+              ];
               serviceConfig = {
                 ExecStart = "${
                   self.packages.${pkgs.system}.server
-                }/bin/rogue-talk-server --host 0.0.0.0 --port ${toString cfg.port}";
+                }/bin/rogue-talk-server --host 0.0.0.0 --port ${toString cfg.port} --levels-dir ${self}/levels";
                 DynamicUser = true;
+                StateDirectory = "rogue-talk";
+                WorkingDirectory = "/var/lib/rogue-talk";
                 Restart = "on-failure";
+                LoadCredential = [
+                  "livekit-api-key:${cfg.livekitApiKeyFile}"
+                  "livekit-api-secret:${cfg.livekitApiSecretFile}"
+                ];
+                Environment = [
+                  "LIVEKIT_API_KEYFILE=%d/livekit-api-key"
+                  "LIVEKIT_API_SECRETFILE=%d/livekit-api-secret"
+                ];
               };
             };
 
-            networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
-            networking.firewall.allowedUDPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
+            networking.firewall = lib.mkIf cfg.openFirewall {
+              allowedTCPPorts = [ cfg.port ];
+              allowedUDPPorts = [ cfg.port ];
+            };
           };
         };
     };

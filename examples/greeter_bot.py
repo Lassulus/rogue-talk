@@ -28,8 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("greeter_bot")
 # Silence noisy loggers
-logging.getLogger("aiortc").setLevel(logging.WARNING)
-logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("livekit").setLevel(logging.WARNING)
 
 
 # Path to the greeting audio file (relative to this script)

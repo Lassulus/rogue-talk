@@ -6,7 +6,6 @@ import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -14,9 +13,6 @@ import numpy.typing as npt
 from ..audio.backend import AudioOutputStream, create_output_stream
 from ..common.audio import get_volume
 from ..common.constants import AUDIO_MAX_DISTANCE, FRAME_SIZE, SAMPLE_RATE
-
-if TYPE_CHECKING:
-    from ..audio.webrtc_tracks import AudioPlaybackTrack
 
 # Debug logging to file (doesn't interfere with terminal UI)
 # Use PID in filename so multiple clients on same machine have separate logs
@@ -207,12 +203,7 @@ class AudioPlayback:
         self._player_positions: dict[str, tuple[int, int]] = {}  # name -> (x, y)
         self._my_position: tuple[int, int] = (0, 0)
         self._streams_lock = threading.Lock()
-        # Multiple WebRTC tracks (keyed by player name)
-        self._playback_tracks: dict[str, "AudioPlaybackTrack"] = {}
-        self._tracks_lock = threading.Lock()
         self._running = False
-        # Poll thread for WebRTC frames
-        self._poll_thread: threading.Thread | None = None
 
     def update_positions(
         self, my_x: int, my_y: int, player_positions: dict[str, tuple[int, int]]
@@ -265,29 +256,24 @@ class AudioPlayback:
             )
         return in_range
 
-    def add_playback_track(self, player_name: str, track: "AudioPlaybackTrack") -> None:
-        """Add a playback track for a player."""
-        _logger.debug(f"add_playback_track called for {player_name}")
-        with self._tracks_lock:
-            if player_name in self._playback_tracks:
-                _logger.debug(f"Track for {player_name} already exists")
-                return  # Already added
-            self._playback_tracks[player_name] = track
-        _logger.debug(f"Added playback track for {player_name}")
+    def feed_audio(self, player_name: str, pcm_data: npt.NDArray[np.float32]) -> None:
+        """Feed audio from a LiveKit participant into the correct player stream."""
+        # Apply client-side proximity volume
+        volume = self._get_proximity_volume(player_name)
+        if volume <= 0.0:
+            return
+
+        stream = self._get_or_create_stream(player_name)
+        if stream is not None:
+            stream.feed_audio(pcm_data, volume)
 
     def start(self) -> None:
         """Start audio playback system."""
         self._running = True
-        # Start polling thread for WebRTC frames
-        self._poll_thread = threading.Thread(target=self._poll_webrtc, daemon=True)
-        self._poll_thread.start()
 
     def stop(self) -> None:
         """Stop all audio streams."""
         self._running = False
-        if self._poll_thread:
-            self._poll_thread.join(timeout=1.0)
-            self._poll_thread = None
 
         with self._streams_lock:
             for stream in self._player_streams.values():
@@ -295,13 +281,11 @@ class AudioPlayback:
             self._player_streams.clear()
 
     def remove_player(self, player_name: str) -> None:
-        """Clean up audio stream and track for a player who left."""
+        """Clean up audio stream for a player who left."""
         with self._streams_lock:
             stream = self._player_streams.pop(player_name, None)
             if stream:
                 stream.stop()
-        with self._tracks_lock:
-            self._playback_tracks.pop(player_name, None)
 
     def _get_proximity_volume(self, player_name: str) -> float:
         """Calculate proximity volume for a player based on positions.
@@ -333,43 +317,3 @@ class AudioPlayback:
             self._player_streams[player_name] = stream
             _logger.debug(f"Created and started PlayerAudioStream for {player_name}")
             return stream
-
-    def _poll_webrtc(self) -> None:
-        """Poll all WebRTC tracks for frames and route to player streams."""
-        frame_count = 0
-        while self._running:
-            # Get snapshot of tracks to poll
-            with self._tracks_lock:
-                tracks = list(self._playback_tracks.items())
-
-            for player_name, track in tracks:
-                # Drain all available frames from this track
-                while True:
-                    pcm_data = track.get_frame()
-                    if pcm_data is None:
-                        break
-                    frame_count += 1
-
-                    # Apply client-side proximity volume
-                    volume = self._get_proximity_volume(player_name)
-                    if volume <= 0.0:
-                        continue
-
-                    if frame_count % 500 == 1:
-                        _logger.debug(
-                            f"Received audio frame {frame_count} from {player_name}, "
-                            f"samples={len(pcm_data)}, volume={volume:.2f}"
-                        )
-                    stream = self._get_or_create_stream(player_name)
-                    if stream is not None:
-                        stream.feed_audio(pcm_data, volume)
-                        # Log audio level periodically
-                        if frame_count % 500 == 1:
-                            level = float(np.abs(pcm_data).max())
-                            _logger.debug(
-                                f"Audio level from {player_name}: {level:.4f}"
-                            )
-                    # else: player is out of range, discard audio
-
-            # Sleep briefly to avoid busy-waiting
-            time.sleep(0.005)  # 5ms

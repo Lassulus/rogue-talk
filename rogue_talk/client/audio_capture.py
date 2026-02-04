@@ -1,4 +1,4 @@
-"""Microphone capture for WebRTC audio track."""
+"""Microphone capture for LiveKit audio source."""
 
 import threading
 import time
@@ -12,14 +12,14 @@ from ..common.constants import CHANNELS, FRAME_SIZE, SAMPLE_RATE
 
 
 class AudioCapture:
-    """Captures audio from microphone and sends raw PCM to WebRTC track.
+    """Captures audio from microphone and sends raw PCM to LiveKit.
 
-    With WebRTC, the audio encoding (Opus) is handled by aiortc, so we just
+    The audio encoding (Opus) is handled by LiveKit, so we just
     pass raw PCM data to the callback.
     """
 
     # VAD settings (set threshold to 0 to disable VAD)
-    VAD_THRESHOLD = 0.0  # Disabled - WebRTC handles this
+    VAD_THRESHOLD = 0.0  # Disabled - LiveKit handles this
     VAD_HOLDOVER_FRAMES = 25  # Continue sending for 500ms after speech ends (25 * 20ms)
 
     def __init__(
@@ -99,5 +99,5 @@ class AudioCapture:
             # Calculate timestamp
             timestamp_ms = int(time.time() * 1000) - self._start_time_ms
 
-            # Send raw PCM to callback (WebRTC track handles encoding)
+            # Send raw PCM to callback (LiveKit handles encoding)
             self.on_frame(pcm, timestamp_ms)

@@ -7,12 +7,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from rogue_talk.common.protocol import (
-    AudioFrame,
     AuthResult,
     PlayerInfo,
     WorldState,
-    deserialize_audio_frame,
-    deserialize_audio_track_map,
     deserialize_auth_challenge,
     deserialize_auth_response,
     deserialize_auth_result,
@@ -24,18 +21,14 @@ from rogue_talk.common.protocol import (
     deserialize_level_manifest_request,
     deserialize_level_pack_data,
     deserialize_level_pack_request,
+    deserialize_livekit_token,
     deserialize_mute_status,
     deserialize_player_joined,
     deserialize_player_left,
     deserialize_position_ack,
     deserialize_position_update,
     deserialize_server_hello,
-    deserialize_webrtc_answer,
-    deserialize_webrtc_ice,
-    deserialize_webrtc_offer,
     deserialize_world_state,
-    serialize_audio_frame,
-    serialize_audio_track_map,
     serialize_auth_challenge,
     serialize_auth_response,
     serialize_auth_result,
@@ -47,15 +40,13 @@ from rogue_talk.common.protocol import (
     serialize_level_manifest_request,
     serialize_level_pack_data,
     serialize_level_pack_request,
+    serialize_livekit_token,
     serialize_mute_status,
     serialize_player_joined,
     serialize_player_left,
     serialize_position_ack,
     serialize_position_update,
     serialize_server_hello,
-    serialize_webrtc_answer,
-    serialize_webrtc_ice,
-    serialize_webrtc_offer,
     serialize_world_state,
 )
 
@@ -202,43 +193,6 @@ class TestWorldState:
             assert p.is_muted == players[i].is_muted
             assert p.name == players[i].name
             assert p.level == players[i].level
-
-
-class TestAudioFrame:
-    """Tests for AUDIO_FRAME message type."""
-
-    def test_roundtrip(self) -> None:
-        """Test basic roundtrip."""
-        frame = AudioFrame(
-            player_id=42,
-            timestamp_ms=1234567890,
-            volume=0.75,
-            opus_data=b"\x00\x01\x02",
-        )
-        data = serialize_audio_frame(frame)
-        result = deserialize_audio_frame(data)
-
-        assert result.player_id == frame.player_id
-        assert result.timestamp_ms == frame.timestamp_ms
-        assert abs(result.volume - frame.volume) < 0.001  # Float precision
-        assert result.opus_data == frame.opus_data
-
-    def test_volume_boundaries(self) -> None:
-        """Test volume at boundaries."""
-        for vol in [0.0, 0.5, 1.0]:
-            frame = AudioFrame(1, 0, vol, b"test")
-            data = serialize_audio_frame(frame)
-            result = deserialize_audio_frame(data)
-            assert abs(result.volume - vol) < 0.001
-
-    @given(st.binary(min_size=1, max_size=1000))
-    @settings(max_examples=20)
-    def test_roundtrip_opus_data(self, opus_data: bytes) -> None:
-        """Property-based test for opus data."""
-        frame = AudioFrame(1, 0, 0.5, opus_data)
-        data = serialize_audio_frame(frame)
-        result = deserialize_audio_frame(data)
-        assert result.opus_data == opus_data
 
 
 class TestPlayerJoined:
@@ -441,68 +395,29 @@ class TestAuthResult:
             assert result == auth_result
 
 
-class TestWebRTCOffer:
-    """Tests for WEBRTC_OFFER message type."""
+class TestLivekitToken:
+    """Tests for LIVEKIT_TOKEN message type."""
 
     def test_roundtrip(self) -> None:
         """Test basic roundtrip."""
-        sdp = "v=0\r\no=- 123 456 IN IP4 127.0.0.1\r\n"
-        data = serialize_webrtc_offer(sdp)
-        result = deserialize_webrtc_offer(data)
-        assert result == sdp
+        url = "ws://localhost:7880"
+        token = "eyJhbGciOiJIUzI1NiJ9.test-token-payload.signature"
+        data = serialize_livekit_token(url, token)
+        result = deserialize_livekit_token(data)
+        assert result == (url, token)
 
-    @given(st.text(max_size=5000))
+    def test_roundtrip_long_token(self) -> None:
+        """Test with a long token string."""
+        url = "wss://livekit.example.com:443"
+        token = "A" * 2000
+        data = serialize_livekit_token(url, token)
+        result = deserialize_livekit_token(data)
+        assert result == (url, token)
+
+    @given(st.text(min_size=1, max_size=200), st.text(min_size=1, max_size=2000))
     @settings(max_examples=20)
-    def test_roundtrip_hypothesis(self, sdp: str) -> None:
+    def test_roundtrip_hypothesis(self, url: str, token: str) -> None:
         """Property-based test."""
-        data = serialize_webrtc_offer(sdp)
-        result = deserialize_webrtc_offer(data)
-        assert result == sdp
-
-
-class TestWebRTCAnswer:
-    """Tests for WEBRTC_ANSWER message type."""
-
-    def test_roundtrip(self) -> None:
-        """Test basic roundtrip."""
-        sdp = "v=0\r\no=- 789 012 IN IP4 127.0.0.1\r\n"
-        data = serialize_webrtc_answer(sdp)
-        result = deserialize_webrtc_answer(data)
-        assert result == sdp
-
-
-class TestWebRTCICE:
-    """Tests for WEBRTC_ICE message type."""
-
-    def test_roundtrip_with_values(self) -> None:
-        """Test with all values present."""
-        sdp_mid = "audio"
-        sdp_mline_index = 0
-        candidate = "candidate:1 1 UDP 2122252543 192.168.1.1 12345 typ host"
-        data = serialize_webrtc_ice(sdp_mid, sdp_mline_index, candidate)
-        result = deserialize_webrtc_ice(data)
-        assert result == (sdp_mid, sdp_mline_index, candidate)
-
-    def test_roundtrip_with_none(self) -> None:
-        """Test with None values."""
-        data = serialize_webrtc_ice(None, None, "candidate:test")
-        result = deserialize_webrtc_ice(data)
-        assert result == (None, 0, "candidate:test")
-
-
-class TestAudioTrackMap:
-    """Tests for AUDIO_TRACK_MAP message type."""
-
-    def test_roundtrip(self) -> None:
-        """Test basic roundtrip."""
-        track_map = {"0": 1, "1": 2, "2": 3}
-        data = serialize_audio_track_map(track_map)
-        result = deserialize_audio_track_map(data)
-        assert result == track_map
-
-    def test_roundtrip_empty(self) -> None:
-        """Test empty map."""
-        track_map: dict[str, int] = {}
-        data = serialize_audio_track_map(track_map)
-        result = deserialize_audio_track_map(data)
-        assert result == track_map
+        data = serialize_livekit_token(url, token)
+        result = deserialize_livekit_token(data)
+        assert result == (url, token)

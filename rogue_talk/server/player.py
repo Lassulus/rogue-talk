@@ -5,12 +5,6 @@ from __future__ import annotations
 import time
 from asyncio import StreamReader, StreamWriter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from aiortc import RTCDataChannel, RTCPeerConnection
-
-    from ..audio.webrtc_tracks import ServerAudioRelay, ServerOutboundTrack
 
 
 @dataclass
@@ -19,16 +13,13 @@ class Player:
     name: str
     x: int
     y: int
-    # Legacy TCP connection (used only for signaling now)
+    # TCP connection (stays open for entire session)
     reader: StreamReader | None = None
     writer: StreamWriter | None = None
-    # WebRTC connection
-    peer_connection: RTCPeerConnection | None = None
-    data_channel: RTCDataChannel | None = None
-    # Audio tracks
-    audio_relay: ServerAudioRelay | None = None
-    # Outbound tracks: source_player_id -> track (one per nearby speaker)
-    outbound_tracks: dict[int, "ServerOutboundTrack"] = field(default_factory=dict)
+    # LiveKit identity (same as player name)
+    livekit_identity: str = ""
+    # Set of LiveKit identities this player is currently subscribed to
+    livekit_subscriptions: set[str] = field(default_factory=set)
     # State
     is_muted: bool = False
     current_level: str = "main"  # Name of the level the player is currently on
@@ -38,6 +29,4 @@ class Player:
         0.0  # Time when last PING was sent (for RTT measurement)
     )
     last_move_time: float = 0.0  # Time of last movement (for speed limiting)
-    webrtc_connected: bool = False
-    needs_renegotiation: bool = False
     ping_ms: int = 0  # RTT in milliseconds measured from PING/PONG

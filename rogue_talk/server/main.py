@@ -18,9 +18,8 @@ def setup_logging(log_file: str) -> None:
             logging.StreamHandler(),
         ],
     )
-    # Suppress noisy aiortc debug logs (RTP packet spam)
-    logging.getLogger("aiortc").setLevel(logging.WARNING)
-    logging.getLogger("aioice").setLevel(logging.WARNING)
+    # Suppress noisy livekit debug logs
+    logging.getLogger("livekit").setLevel(logging.WARNING)
 
 
 def main() -> None:

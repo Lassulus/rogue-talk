@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import queue
-import tempfile
 import time
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
@@ -14,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 import numpy as np
 import numpy.typing as npt
-from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
+from livekit import rtc as livekit_rtc
 
 from ..audio.pcm import to_float32
 from ..common.constants import AUDIO_MAX_DISTANCE, FRAME_SIZE, SAMPLE_RATE
@@ -23,33 +21,27 @@ from ..common.protocol import (
     AuthResult,
     MessageType,
     PlayerInfo,
-    deserialize_audio_track_map,
     deserialize_auth_challenge,
     deserialize_auth_result,
     deserialize_door_transition,
+    deserialize_livekit_token,
     deserialize_player_joined,
     deserialize_player_left,
     deserialize_position_ack,
     deserialize_server_hello,
-    deserialize_webrtc_answer,
-    deserialize_webrtc_offer,
     deserialize_world_state,
     read_message,
     serialize_auth_response,
     serialize_mute_status,
     serialize_position_update,
-    serialize_webrtc_answer,
-    serialize_webrtc_offer,
     write_message,
 )
 from .audio import AudioSource, FileAudioSource, PCMAudioSource
-from .audio_track import BotAudioCaptureTrack
+from .audio_track import BotAudioTrack
 from .pathfinding import find_path
 from .types import BotConfig, Direction, PlayerState, WorldState
 
 if TYPE_CHECKING:
-    from aiortc import RTCDataChannel
-
     from ..client.level import Level
 
 logger = logging.getLogger(__name__)
@@ -148,16 +140,18 @@ class BotClient:
         self._speaking_players: dict[int, float] = {}  # player_id -> last_audio_time
         self._speaking_timeout = 0.5  # seconds of silence before "stopped speaking"
 
-        # Network
+        # Network (TCP stays open for entire session)
         self._reader: StreamReader | None = None
         self._writer: StreamWriter | None = None
-        self._peer_connection: RTCPeerConnection | None = None
-        self._data_channel: RTCDataChannel | None = None
-        self._webrtc_connected: bool = False
+
+        # LiveKit
+        self._livekit_room: livekit_rtc.Room | None = None
+        self._livekit_audio_source: livekit_rtc.AudioSource | None = None
+        self._livekit_connected: bool = False
+        self._audio_receive_tasks: dict[str, asyncio.Task[None]] = {}
 
         # Audio
-        self._audio_capture_track: BotAudioCaptureTrack | None = None
-        self._audio_playback_track: Any = None  # AudioPlaybackTrack
+        self._bot_audio_track: BotAudioTrack | None = None
 
         # Movement
         self._move_seq: int = 0
@@ -169,8 +163,6 @@ class BotClient:
 
         # Running state
         self._running = False
-        self._data_channel_ready = asyncio.Event()
-        self._connection_closed = asyncio.Event()
 
         # Event callbacks
         self._on_world_state_callbacks: list[WorldStateCallback] = []
@@ -308,9 +300,17 @@ class BotClient:
         self._level = Level.from_bytes(level_data)
         self.current_level = level_name
 
-        # Set up WebRTC connection
-        if not await self._setup_webrtc():
-            logger.error("Failed to establish WebRTC connection")
+        # Wait for LIVEKIT_TOKEN
+        msg_type, payload = await read_message(self._reader)
+        if msg_type != MessageType.LIVEKIT_TOKEN:
+            logger.error("Unexpected response from server (expected LIVEKIT_TOKEN)")
+            return False
+
+        livekit_url, livekit_token = deserialize_livekit_token(payload)
+
+        # Connect to LiveKit
+        if not await self._connect_livekit(livekit_url, livekit_token):
+            logger.error("Failed to connect to LiveKit")
             return False
 
         logger.info(
@@ -318,128 +318,83 @@ class BotClient:
         )
         return True
 
-    async def _setup_webrtc(self) -> bool:
-        """Set up WebRTC peer connection with the server."""
-        if not self._writer or not self._reader:
-            return False
-
-        self._peer_connection = RTCPeerConnection()
-        pc = self._peer_connection
-
-        # Create audio capture track for sending audio
-        if self.config.audio_enabled:
-            self._audio_capture_track = BotAudioCaptureTrack()
-            pc.addTrack(self._audio_capture_track)
-
-        # Create data channel for game messages
-        self._data_channel = pc.createDataChannel("game", ordered=True)
-
-        @self._data_channel.on("open")
-        def on_open() -> None:
-            logger.info("Data channel opened")
-            self._data_channel_ready.set()
-
-        @self._data_channel.on("message")
-        def on_message(message: bytes | str) -> None:
-            if isinstance(message, str):
-                message = message.encode("utf-8")
-            asyncio.create_task(self._handle_data_channel_message(message))
-
-        # Handle incoming audio track from server
-        @pc.on("track")
-        def on_track(track: Any) -> None:
-            if track.kind == "audio":
-                logger.info("Received audio track from server")
-                asyncio.create_task(self._handle_incoming_audio(track))
-
-        # Handle connection state changes
-        @pc.on("connectionstatechange")
-        async def on_connectionstatechange() -> None:
-            state = pc.connectionState
-            logger.info(f"WebRTC connection state: {state}")
-            if state in ("failed", "closed", "disconnected"):
-                self._connection_closed.set()
-                self._running = False
-            elif state == "connected":
-                self._webrtc_connected = True
-
-        # Create and send offer
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-
-        offer_sdp = pc.localDescription.sdp if pc.localDescription else ""
-        await write_message(
-            self._writer,
-            MessageType.WEBRTC_OFFER,
-            serialize_webrtc_offer(offer_sdp),
-        )
-
-        # Wait for answer
-        msg_type, payload = await read_message(self._reader)
-        if msg_type != MessageType.WEBRTC_ANSWER:
-            logger.error(f"Expected WEBRTC_ANSWER, got {msg_type}")
-            return False
-
-        answer_sdp = deserialize_webrtc_answer(payload)
-        await pc.setRemoteDescription(
-            RTCSessionDescription(sdp=answer_sdp, type="answer")
-        )
-
-        # Wait for data channel to be ready
+    async def _connect_livekit(self, url: str, token: str) -> bool:
+        """Connect to LiveKit SFU and set up audio publishing."""
         try:
-            await asyncio.wait_for(self._data_channel_ready.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.error("Timeout waiting for WebRTC data channel")
-            return False
+            self._livekit_room = livekit_rtc.Room()
+            room = self._livekit_room
 
-        self._webrtc_connected = True
-
-        # Close TCP connection (signaling complete)
-        self._writer.close()
-        try:
-            await self._writer.wait_closed()
-        except Exception:
-            pass
-        self._reader = None
-        self._writer = None
-
-        return True
-
-    async def _handle_incoming_audio(self, track: MediaStreamTrack) -> None:
-        """Handle incoming audio from other players."""
-        while self._running:
-            try:
-                frame = await track.recv()
-                if not hasattr(frame, "to_ndarray"):
-                    continue
-
-                pcm_data = frame.to_ndarray()
-
-                # Extract source player ID from first 2 samples (int16)
-                if pcm_data.dtype == np.int16 and len(pcm_data.flatten()) >= 2:
-                    flat = pcm_data.flatten()
-                    source_player_id = int(flat[0] & 0xFFFF) | (
-                        int(flat[1] & 0xFFFF) << 16
+            # Handle incoming audio tracks
+            @room.on("track_subscribed")  # type: ignore[misc]
+            def on_track_subscribed(
+                track: livekit_rtc.Track,
+                publication: livekit_rtc.RemoteTrackPublication,
+                participant: livekit_rtc.RemoteParticipant,
+            ) -> None:
+                if track.kind == livekit_rtc.TrackKind.KIND_AUDIO:
+                    player_name = participant.identity
+                    task = asyncio.create_task(
+                        self._handle_incoming_audio(player_name, track)
                     )
-                else:
-                    source_player_id = 0
+                    self._audio_receive_tasks[player_name] = task
+
+            @room.on("track_unsubscribed")  # type: ignore[misc]
+            def on_track_unsubscribed(
+                track: livekit_rtc.Track,
+                publication: livekit_rtc.RemoteTrackPublication,
+                participant: livekit_rtc.RemoteParticipant,
+            ) -> None:
+                player_name = participant.identity
+                task = self._audio_receive_tasks.pop(player_name, None)
+                if task:
+                    task.cancel()
+
+            # Connect to the room
+            await room.connect(url, token)
+
+            # Create audio source and publish
+            if self.config.audio_enabled:
+                self._livekit_audio_source = livekit_rtc.AudioSource(
+                    SAMPLE_RATE,
+                    1,  # mono
+                )
+                local_track = livekit_rtc.LocalAudioTrack.create_audio_track(
+                    "bot-audio", self._livekit_audio_source
+                )
+                await room.local_participant.publish_track(local_track)
+
+                # Create bot audio track that feeds into LiveKit
+                self._bot_audio_track = BotAudioTrack(self._livekit_audio_source)
+
+            self._livekit_connected = True
+            return True
+        except Exception as e:
+            logger.error(f"LiveKit connection failed: {e}")
+            return False
+
+    async def _handle_incoming_audio(
+        self,
+        player_name: str,
+        track: livekit_rtc.RemoteAudioTrack,
+    ) -> None:
+        """Handle incoming audio from other players via LiveKit."""
+        try:
+            audio_stream = livekit_rtc.AudioStream(track)
+            async for frame_event in audio_stream:
+                frame = frame_event.frame
+                # Convert int16 PCM from LiveKit to float32
+                samples = np.frombuffer(frame.data, dtype=np.int16)
+                pcm_float = samples.astype(np.float32) / 32768.0
+
+                # Look up player ID from name
+                source_player_id = 0
+                for p in self._world_state.players:
+                    if p.name == player_name:
+                        source_player_id = p.player_id
+                        break
 
                 if source_player_id == 0:
-                    continue  # Silence frame
-
-                # Convert to float32 and normalize
-                pcm_float = to_float32(pcm_data)
-
-                pcm_float = pcm_float.flatten()
-
-                # Handle stereo if needed
-                layout_name = getattr(getattr(frame, "layout", None), "name", "mono")
-                if layout_name == "stereo" and len(pcm_float) > 0:
-                    pcm_float = pcm_float[::2]
-
-                # Skip first 2 samples (player ID)
-                if len(pcm_float) > 2:
-                    pcm_float = pcm_float[2:]
+                    continue
 
                 # Calculate volume (RMS)
                 volume = float(np.sqrt(np.mean(pcm_float**2)))
@@ -467,11 +422,10 @@ class BotClient:
                     except Exception as e:
                         logger.error(f"Error in on_audio callback: {e}")
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error receiving audio: {e}")
-                break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error receiving audio from {player_name}: {e}")
 
     async def disconnect(self) -> None:
         """Disconnect from the server."""
@@ -484,8 +438,18 @@ class BotClient:
             except asyncio.CancelledError:
                 pass
 
-        if self._peer_connection:
-            await self._peer_connection.close()
+        # Cancel audio receive tasks
+        for task in self._audio_receive_tasks.values():
+            task.cancel()
+        for task in self._audio_receive_tasks.values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._audio_receive_tasks.clear()
+
+        if self._livekit_room:
+            await self._livekit_room.disconnect()
 
         if self._writer:
             self._writer.close()
@@ -508,6 +472,14 @@ class BotClient:
         # Start speaking timeout checker
         speaking_checker_task = asyncio.create_task(self._check_speaking_timeouts())
 
+        # Start TCP message receiver
+        message_receiver_task = asyncio.create_task(self._receive_messages())
+
+        # Start bot audio track processing if enabled
+        audio_task: asyncio.Task[None] | None = None
+        if self._bot_audio_track:
+            audio_task = asyncio.create_task(self._bot_audio_track.run())
+
         try:
             while self._running:
                 await asyncio.sleep(0.05)
@@ -515,6 +487,9 @@ class BotClient:
             self._running = False
             position_sender_task.cancel()
             speaking_checker_task.cancel()
+            message_receiver_task.cancel()
+            if audio_task:
+                audio_task.cancel()
             try:
                 await position_sender_task
             except asyncio.CancelledError:
@@ -523,6 +498,15 @@ class BotClient:
                 await speaking_checker_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await message_receiver_task
+            except asyncio.CancelledError:
+                pass
+            if audio_task:
+                try:
+                    await audio_task
+                except asyncio.CancelledError:
+                    pass
             await self.disconnect()
 
     async def _check_speaking_timeouts(self) -> None:
@@ -550,18 +534,19 @@ class BotClient:
 
     # Message handling
 
-    async def _handle_data_channel_message(self, data: bytes) -> None:
-        """Handle a message received via WebRTC data channel."""
-        if len(data) < 1:
-            return
+    async def _receive_messages(self) -> None:
+        """Receive and handle messages from server over TCP."""
         try:
-            msg_type = MessageType(data[0])
-        except ValueError:
-            # Unknown message type - ignore it
-            logger.debug(f"Ignoring unknown message type: {data[0]}")
-            return
-        payload = data[1:]
-        await self._handle_server_message(msg_type, payload)
+            while self._running and self._reader:
+                msg_type, payload = await read_message(self._reader)
+                await self._handle_server_message(msg_type, payload)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+        ):
+            self._running = False
 
     async def _handle_server_message(
         self, msg_type: MessageType, payload: bytes
@@ -657,51 +642,19 @@ class BotClient:
             self.y = spawn_y
             self.current_level = target_level
             self._pending_moves.clear()
-            # Note: Level data would need to be requested separately
             logger.info(f"Door transition to {target_level} at ({spawn_x}, {spawn_y})")
 
         elif msg_type == MessageType.PING:
-            self._send_data_channel_message(MessageType.PONG, b"")
+            await self._send_message(MessageType.PONG, b"")
 
-        elif msg_type == MessageType.WEBRTC_OFFER:
-            # Renegotiation offer from server (new audio tracks)
-            logger.debug("Received WEBRTC_OFFER for renegotiation")
-            offer_sdp = deserialize_webrtc_offer(payload)
-            await self._handle_renegotiation_offer(offer_sdp)
-
-        elif msg_type == MessageType.AUDIO_TRACK_MAP:
-            # Track mapping - bot doesn't need to process this currently
-            logger.debug("Received AUDIO_TRACK_MAP")
-
-    async def _handle_renegotiation_offer(self, offer_sdp: str) -> None:
-        """Handle a renegotiation offer from the server."""
-        if not self._peer_connection:
+    async def _send_message(self, msg_type: MessageType, payload: bytes) -> None:
+        """Send a message to the server via TCP."""
+        if self._writer is None:
             return
-
         try:
-            logger.debug("Processing renegotiation offer")
-            # Set remote description (the new offer)
-            await self._peer_connection.setRemoteDescription(
-                RTCSessionDescription(sdp=offer_sdp, type="offer")
-            )
-
-            # Create and set answer
-            answer = await self._peer_connection.createAnswer()
-            await self._peer_connection.setLocalDescription(answer)
-
-            # Send answer back to server via data channel
-            answer_sdp = (
-                self._peer_connection.localDescription.sdp
-                if self._peer_connection.localDescription
-                else ""
-            )
-            self._send_data_channel_message(
-                MessageType.WEBRTC_ANSWER,
-                serialize_webrtc_answer(answer_sdp),
-            )
-            logger.debug("Sent renegotiation answer")
-        except Exception as e:
-            logger.error(f"Renegotiation failed: {e}")
+            await write_message(self._writer, msg_type, payload)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self._running = False
 
     async def _check_proximity_changes(self) -> None:
         """Check for players entering or leaving audio range."""
@@ -744,18 +697,8 @@ class BotClient:
 
         self._previous_nearby_players = current_nearby
 
-    def _send_data_channel_message(self, msg_type: MessageType, payload: bytes) -> None:
-        """Send a message via WebRTC data channel."""
-        if not self._webrtc_connected or self._data_channel is None:
-            return
-        try:
-            message = bytes([msg_type]) + payload
-            self._data_channel.send(message)
-        except Exception:
-            pass
-
     async def _send_position_updates(self) -> None:
-        """Send position updates from the queue to the server."""
+        """Send position updates from the queue to the server via TCP."""
         while self._running:
             try:
                 if self._position_queue is None:
@@ -764,11 +707,8 @@ class BotClient:
                 seq, x, y = await asyncio.wait_for(
                     self._position_queue.get(), timeout=0.1
                 )
-                if self._webrtc_connected:
-                    payload = serialize_position_update(seq, x, y)
-                    self._send_data_channel_message(
-                        MessageType.POSITION_UPDATE, payload
-                    )
+                payload = serialize_position_update(seq, x, y)
+                await self._send_message(MessageType.POSITION_UPDATE, payload)
             except asyncio.TimeoutError:
                 continue
 
@@ -783,11 +723,7 @@ class BotClient:
         Returns:
             True if move was valid, False if blocked.
         """
-        if (
-            not self._level
-            or not self._webrtc_connected
-            or self._position_queue is None
-        ):
+        if not self._level or self._position_queue is None:
             return False
 
         dx, dy = direction.dx, direction.dy
@@ -892,11 +828,11 @@ class BotClient:
         Args:
             path: Path to WAV file.
         """
-        if not self._audio_capture_track or self.is_muted:
+        if not self._bot_audio_track or self.is_muted:
             return
 
         source = FileAudioSource(path)
-        self._audio_capture_track.queue_source(source)
+        self._bot_audio_track.queue_source(source)
 
     async def speak_pcm(
         self,
@@ -909,29 +845,29 @@ class BotClient:
             samples: Float32 mono audio samples.
             sample_rate: Sample rate of the audio.
         """
-        if not self._audio_capture_track or self.is_muted:
+        if not self._bot_audio_track or self.is_muted:
             return
 
         source = PCMAudioSource(samples, sample_rate)
         source.finish()
-        self._audio_capture_track.queue_source(source)
+        self._bot_audio_track.queue_source(source)
 
     def mute(self) -> None:
         """Mute the bot's audio output."""
         self.is_muted = True
-        if self._audio_capture_track:
-            self._audio_capture_track.set_muted(True)
-        self._send_data_channel_message(
-            MessageType.MUTE_STATUS, serialize_mute_status(True)
+        if self._bot_audio_track:
+            self._bot_audio_track.set_muted(True)
+        asyncio.create_task(
+            self._send_message(MessageType.MUTE_STATUS, serialize_mute_status(True))
         )
 
     def unmute(self) -> None:
         """Unmute the bot's audio output."""
         self.is_muted = False
-        if self._audio_capture_track:
-            self._audio_capture_track.set_muted(False)
-        self._send_data_channel_message(
-            MessageType.MUTE_STATUS, serialize_mute_status(False)
+        if self._bot_audio_track:
+            self._bot_audio_track.set_muted(False)
+        asyncio.create_task(
+            self._send_message(MessageType.MUTE_STATUS, serialize_mute_status(False))
         )
 
     def is_playing(self) -> bool:
@@ -940,6 +876,6 @@ class BotClient:
         Returns:
             True if audio is currently being played.
         """
-        if not self._audio_capture_track:
+        if not self._bot_audio_track:
             return False
-        return self._audio_capture_track.is_playing()
+        return self._bot_audio_track.is_playing()

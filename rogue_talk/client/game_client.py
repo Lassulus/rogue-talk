@@ -7,14 +7,15 @@ import logging
 import struct
 import tempfile
 import time
+import urllib.parse
 import warnings
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from aiortc import RTCPeerConnection, RTCSessionDescription
 from blessed import Terminal
 from blessed.keyboard import Keystroke
+from livekit import rtc as livekit_rtc
 
 _logger = logging.getLogger(__name__)
 
@@ -36,27 +37,24 @@ def _asyncio_exception_handler(
 
 
 from ..audio.sound_loader import SoundCache
-from ..audio.webrtc_tracks import AudioCaptureTrack, AudioPlaybackTrack
 from ..common import tiles as tile_defs
-from ..common.constants import MOVEMENT_TICK_INTERVAL
+from ..common.constants import FRAME_SIZE, MOVEMENT_TICK_INTERVAL, SAMPLE_RATE
 from ..common.crypto import sign_challenge
 from ..common.protocol import (
     AuthResult,
     MessageType,
     PlayerInfo,
-    deserialize_audio_track_map,
     deserialize_auth_challenge,
     deserialize_auth_result,
     deserialize_door_transition,
     deserialize_level_files_data,
     deserialize_level_manifest,
     deserialize_level_pack_data,
+    deserialize_livekit_token,
     deserialize_player_joined,
     deserialize_player_left,
     deserialize_position_ack,
     deserialize_server_hello,
-    deserialize_webrtc_answer,
-    deserialize_webrtc_offer,
     deserialize_world_state,
     read_message,
     serialize_auth_response,
@@ -65,8 +63,6 @@ from ..common.protocol import (
     serialize_level_pack_request,
     serialize_mute_status,
     serialize_position_update,
-    serialize_webrtc_answer,
-    serialize_webrtc_offer,
     write_message,
 )
 from .identity import Identity, load_or_create_identity
@@ -97,8 +93,6 @@ from .terminal_ui import TerminalUI
 from .tile_sound_player import TileSoundPlayer
 
 if TYPE_CHECKING:
-    from aiortc import RTCDataChannel
-
     from .audio_capture import AudioCapture
     from .audio_playback import AudioPlayback
 
@@ -131,19 +125,15 @@ class GameClient:
         self._interact_anim_start: float = 0.0
         self._interact_chars_per_sec: float = 60.0  # Typewriter speed
         self.players: list[PlayerInfo] = []
-        # TCP connection (only used for signaling)
+        # TCP connection (stays open for entire session)
         self.reader: StreamReader | None = None
         self.writer: StreamWriter | None = None
-        # WebRTC connection
-        self.peer_connection: RTCPeerConnection | None = None
-        self.data_channel: RTCDataChannel | None = None
-        self.webrtc_connected: bool = False
-        # WebRTC audio
-        self.audio_capture_track: AudioCaptureTrack | None = None
-        # Multiple playback tracks: player_name -> AudioPlaybackTrack
-        self.audio_playback_tracks: dict[str, AudioPlaybackTrack] = {}
-        # Track MID -> player_id mapping (from server, used to look up names)
-        self._track_map: dict[str, int] = {}
+        # LiveKit room connection
+        self._livekit_room: livekit_rtc.Room | None = None
+        self._livekit_audio_source: livekit_rtc.AudioSource | None = None
+        self._livekit_connected: bool = False
+        # Track async tasks for receiving audio from remote participants
+        self._audio_receive_tasks: dict[str, asyncio.Task[None]] = {}
         self.running = False
         self._needs_render = True  # Flag to track when re-render is needed
         self._last_render_time = 0.0  # For periodic updates (mic level, animations)
@@ -169,9 +159,6 @@ class GameClient:
         self._stream_player: StreamPlayer = StreamPlayer()
         # Other levels loaded for see-through portals
         self.other_levels: dict[str, Level] = {}
-        # WebRTC connection events
-        self._data_channel_ready = asyncio.Event()
-        self._connection_closed = asyncio.Event()
         # Pending futures for level caching protocol
         self._pending_manifest_future: asyncio.Future[bytes] | None = None
         self._pending_files_future: asyncio.Future[bytes] | None = None
@@ -308,7 +295,10 @@ class GameClient:
         print(f"Received SERVER_HELLO: player_id={self.player_id}, level={level_name}")
 
         # Request level files using content-addressed caching
+        # The server sends LIVEKIT_TOKEN right after SERVER_HELLO, so it may
+        # arrive while we're exchanging level data. Buffer it if we see it.
         print("Requesting level files...")
+        self._buffered_livekit_token: tuple[str, str] | None = None
         level_pack = await self._request_level_cached_tcp(level_name)
         if level_pack is None:
             print("Failed to load level pack")
@@ -333,22 +323,46 @@ class GameClient:
         interactions = parse_interactions(level_pack.level_json_path)
         self.level.interactions = interactions
 
-        # Set up WebRTC connection
-        print("Setting up WebRTC connection...")
-        if not await self._setup_webrtc():
-            print("Failed to establish WebRTC connection")
+        # Get LIVEKIT_TOKEN (may have been buffered during level loading)
+        if self._buffered_livekit_token is not None:
+            livekit_url, livekit_token = self._buffered_livekit_token
+        else:
+            print("Waiting for LiveKit token...")
+            try:
+                msg_type, payload = await asyncio.wait_for(
+                    read_message(reader), timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                print("Timeout waiting for LIVEKIT_TOKEN")
+                return False
+            except asyncio.IncompleteReadError as e:
+                print(f"Connection closed while waiting for LiveKit token: {e}")
+                return False
+
+            if msg_type != MessageType.LIVEKIT_TOKEN:
+                print(
+                    f"Unexpected response from server: got {msg_type.name}, expected LIVEKIT_TOKEN"
+                )
+                return False
+
+            livekit_url, livekit_token = deserialize_livekit_token(payload)
+
+        # Replace the host in the LiveKit URL with the game server host,
+        # since LiveKit runs on the same machine as the game server.
+        livekit_url = self._rewrite_livekit_url(livekit_url)
+        print(f"Received LiveKit token, connecting to {livekit_url}...")
+
+        # Connect to LiveKit SFU
+        if not await self._connect_livekit(livekit_url, livekit_token):
+            print("Failed to connect to LiveKit")
             return False
 
-        # Load other levels for see-through portals (via data channel now)
-        await self._load_see_through_portal_levels()
+        print("LiveKit connection established")
 
         return True
 
     async def _request_level_cached_tcp(self, level_name: str) -> LevelPack | None:
-        """Request level files via TCP using content-addressed caching.
-
-        This is used during initial connection before WebRTC is established.
-        """
+        """Request level files via TCP using content-addressed caching."""
         if not self.writer or not self.reader:
             return None
 
@@ -367,6 +381,8 @@ class GameClient:
                 )
                 if msg_type == MessageType.LEVEL_MANIFEST:
                     break
+                if msg_type == MessageType.LIVEKIT_TOKEN:
+                    self._buffered_livekit_token = deserialize_livekit_token(payload)
                 # Ignore other messages during initial connection
         except asyncio.TimeoutError:
             print("Timeout waiting for LEVEL_MANIFEST")
@@ -401,6 +417,10 @@ class GameClient:
                     )
                     if msg_type == MessageType.LEVEL_FILES_DATA:
                         break
+                    if msg_type == MessageType.LIVEKIT_TOKEN:
+                        self._buffered_livekit_token = deserialize_livekit_token(
+                            payload
+                        )
                     # Ignore other messages
             except asyncio.TimeoutError:
                 print("Timeout waiting for LEVEL_FILES_DATA")
@@ -435,101 +455,100 @@ class GameClient:
             print(f"Failed to create level pack: {e}")
             return None
 
-    async def _setup_webrtc(self) -> bool:
-        """Set up WebRTC peer connection with the server."""
-        if not self.writer or not self.reader:
-            return False
-
-        # Create peer connection
-        self.peer_connection = RTCPeerConnection()
-        pc = self.peer_connection
-
-        # Create audio capture track for sending voice
-        self.audio_capture_track = AudioCaptureTrack()
-        pc.addTrack(self.audio_capture_track)
-
-        # Create data channel for game messages
-        self.data_channel = pc.createDataChannel("game", ordered=True)
-
-        @self.data_channel.on("open")
-        def on_open() -> None:
-            print("Data channel opened")
-            self._data_channel_ready.set()
-
-        @self.data_channel.on("message")
-        def on_message(message: bytes | str) -> None:
-            if isinstance(message, str):
-                message = message.encode("utf-8")
-            asyncio.create_task(self._handle_data_channel_message(message))
-
-        # Handle incoming audio track from server
-        @pc.on("track")
-        def on_track(track: Any) -> None:
-            if track.kind == "audio":
-                _logger.debug(f"on_track fired, track_map={self._track_map}")
-                # Find which transceiver this track belongs to
-                player_name = self._get_source_player_for_track(track)
-                if player_name is not None:
-                    _logger.debug(f"Matched track to {player_name}")
-                    self._setup_playback_track(player_name, track)
-                else:
-                    _logger.debug("Could not match track to player")
-
-        # Handle connection state changes
-        @pc.on("connectionstatechange")
-        async def on_connectionstatechange() -> None:
-            state = pc.connectionState
-            _logger.info(f"WebRTC connection state: {state}")
-            if state in ("failed", "closed", "disconnected"):
-                self._connection_closed.set()
-                self.running = False
-            elif state == "connected":
-                self.webrtc_connected = True
-
-        # Create and send offer
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-
-        offer_sdp = pc.localDescription.sdp if pc.localDescription else ""
-        await write_message(
-            self.writer,
-            MessageType.WEBRTC_OFFER,
-            serialize_webrtc_offer(offer_sdp),
-        )
-
-        # Wait for answer
-        msg_type, payload = await read_message(self.reader)
-        if msg_type != MessageType.WEBRTC_ANSWER:
-            print(f"Expected WEBRTC_ANSWER, got {msg_type}")
-            return False
-
-        answer_sdp = deserialize_webrtc_answer(payload)
-        await pc.setRemoteDescription(
-            RTCSessionDescription(sdp=answer_sdp, type="answer")
-        )
-
-        # Wait for data channel to be ready with timeout
+    async def _connect_livekit(self, url: str, token: str) -> bool:
+        """Connect to LiveKit SFU and set up audio publishing."""
         try:
-            await asyncio.wait_for(self._data_channel_ready.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            print("Timeout waiting for WebRTC data channel")
+            self._livekit_room = livekit_rtc.Room()
+            room = self._livekit_room
+
+            # Handle incoming audio tracks (when server subscribes us to someone)
+            @room.on("track_subscribed")  # type: ignore[misc]
+            def on_track_subscribed(
+                track: livekit_rtc.Track,
+                publication: livekit_rtc.RemoteTrackPublication,
+                participant: livekit_rtc.RemoteParticipant,
+            ) -> None:
+                if track.kind == livekit_rtc.TrackKind.KIND_AUDIO:
+                    player_name = participant.identity
+                    _logger.debug(f"Track subscribed from {player_name}")
+                    # Start receiving audio from this participant
+                    task = asyncio.create_task(
+                        self._receive_audio_from_participant(
+                            player_name,
+                            track,
+                        )
+                    )
+                    self._audio_receive_tasks[player_name] = task
+
+            @room.on("track_unsubscribed")  # type: ignore[misc]
+            def on_track_unsubscribed(
+                track: livekit_rtc.Track,
+                publication: livekit_rtc.RemoteTrackPublication,
+                participant: livekit_rtc.RemoteParticipant,
+            ) -> None:
+                player_name = participant.identity
+                _logger.debug(f"Track unsubscribed from {player_name}")
+                # Cancel the receive task
+                task = self._audio_receive_tasks.pop(player_name, None)
+                if task:
+                    task.cancel()
+                # Clean up playback
+                if self.audio_playback:
+                    self.audio_playback.remove_player(player_name)
+
+            # Connect to the room
+            await room.connect(url, token)
+
+            # Create audio source and publish a local audio track
+            self._livekit_audio_source = livekit_rtc.AudioSource(
+                SAMPLE_RATE,
+                1,  # mono
+            )
+            local_track = livekit_rtc.LocalAudioTrack.create_audio_track(
+                "microphone", self._livekit_audio_source
+            )
+            await room.local_participant.publish_track(local_track)
+
+            self._livekit_connected = True
+            return True
+        except Exception as e:
+            print(f"LiveKit connection failed: {type(e).__name__}: {e}")
+            _logger.error(f"LiveKit connection failed: {e}")
             return False
 
-        # Mark as WebRTC connected (data channel is ready)
-        self.webrtc_connected = True
+    async def _receive_audio_from_participant(
+        self,
+        player_name: str,
+        track: livekit_rtc.RemoteAudioTrack,
+    ) -> None:
+        """Receive audio frames from a LiveKit participant and feed to playback."""
+        import numpy as np
 
-        print("WebRTC connection established, closing TCP signaling")
-
-        # Close TCP connection (signaling complete)
-        self.writer.close()
         try:
-            await self.writer.wait_closed()
-        except Exception:
+            audio_stream = livekit_rtc.AudioStream(track)
+            async for frame_event in audio_stream:
+                frame = frame_event.frame
+                # Convert int16 PCM from LiveKit to float32 for playback pipeline
+                samples = np.frombuffer(frame.data, dtype=np.int16)
+                float_samples = samples.astype(np.float32) / 32768.0
+
+                if self.audio_playback:
+                    self.audio_playback.feed_audio(player_name, float_samples)
+        except asyncio.CancelledError:
             pass
-        self.reader = None
-        self.writer = None
+        except Exception as e:
+            _logger.error(f"Error receiving audio from {player_name}: {e}")
 
-        return True
+    def _rewrite_livekit_url(self, livekit_url: str) -> str:
+        """Replace the host in the LiveKit URL with the game server host.
+
+        LiveKit runs on the same machine as the game server, so the client
+        should connect to LiveKit using the same host it used for TCP.
+        """
+        parsed = urllib.parse.urlparse(livekit_url)
+        return urllib.parse.urlunparse(
+            parsed._replace(netloc=f"{self.host}:{parsed.port or 7880}")
+        )
 
     def _get_player_name_by_id(self, player_id: int) -> str | None:
         """Look up a player's name by their ID."""
@@ -537,66 +556,6 @@ class GameClient:
             if p.player_id == player_id:
                 return p.name
         return None
-
-    def _get_source_player_for_track(self, track: Any) -> str | None:
-        """Find the source player name for an incoming track using the track map."""
-        if not self.peer_connection:
-            return None
-
-        # Find the transceiver that has this track as its receiver's track
-        for transceiver in self.peer_connection.getTransceivers():
-            if transceiver.receiver and transceiver.receiver.track == track:
-                mid = transceiver.mid
-                if mid and mid in self._track_map:
-                    player_id = self._track_map[mid]
-                    return self._get_player_name_by_id(player_id)
-        return None
-
-    def _setup_playback_track(self, player_name: str, track: Any) -> None:
-        """Set up a playback track for a player."""
-        # Create new playback track if needed
-        if player_name not in self.audio_playback_tracks:
-            playback = AudioPlaybackTrack(player_name)
-            self.audio_playback_tracks[player_name] = playback
-
-        # Set the track and start receiving
-        playback = self.audio_playback_tracks[player_name]
-        playback.set_track(track)
-        asyncio.create_task(playback.start())
-
-        # Update AudioPlayback to know about this track
-        if self.audio_playback:
-            self.audio_playback.add_playback_track(player_name, playback)
-
-    async def _handle_renegotiation_offer(self, offer_sdp: str) -> None:
-        """Handle a renegotiation offer from the server."""
-        if not self.peer_connection:
-            return
-
-        try:
-            _logger.debug("Processing renegotiation offer")
-            # Set remote description (the new offer)
-            await self.peer_connection.setRemoteDescription(
-                RTCSessionDescription(sdp=offer_sdp, type="offer")
-            )
-
-            # Create and set answer
-            answer = await self.peer_connection.createAnswer()
-            await self.peer_connection.setLocalDescription(answer)
-
-            # Send answer back to server via data channel
-            answer_sdp = (
-                self.peer_connection.localDescription.sdp
-                if self.peer_connection.localDescription
-                else ""
-            )
-            self._send_data_channel_message(
-                MessageType.WEBRTC_ANSWER,
-                serialize_webrtc_answer(answer_sdp),
-            )
-            _logger.debug("Sent renegotiation answer")
-        except Exception as e:
-            _logger.error(f"Renegotiation failed: {e}")
 
     async def run(self) -> None:
         """Main client loop."""
@@ -611,15 +570,23 @@ class GameClient:
         logging.captureWarnings(True)
         warnings.filterwarnings("always")  # Let logging handle all warnings
 
-        # Start audio capture (feeds into WebRTC audio track)
+        # Start audio capture (feeds into LiveKit audio source)
         await self._start_audio()
 
         # Initialize audio playback with our known position
         if self.audio_playback:
             self.audio_playback.update_positions(self.x, self.y, {})
 
-        # Start position sender task (uses data channel)
+        # Start position sender task (uses TCP)
         position_sender_task = asyncio.create_task(self._send_position_updates())
+
+        # Start TCP message receiver task (must start before loading portal levels,
+        # since _request_level_cached uses futures fulfilled by the receiver)
+        message_receiver_task = asyncio.create_task(self._receive_messages())
+
+        # Load other levels for see-through portals (via TCP)
+        # This needs the message receiver task running to handle responses.
+        await self._load_see_through_portal_levels()
 
         try:
             with self.term.fullscreen(), self.term.cbreak(), self.term.hidden_cursor():
@@ -658,22 +625,32 @@ class GameClient:
         finally:
             self.running = False
             position_sender_task.cancel()
+            message_receiver_task.cancel()
             try:
                 await position_sender_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await message_receiver_task
+            except asyncio.CancelledError:
+                pass
             await self._stop_audio()
 
-            # Stop all audio playback tracks
-            for playback in self.audio_playback_tracks.values():
-                await playback.stop()
-            self.audio_playback_tracks.clear()
+            # Cancel all audio receive tasks
+            for task in self._audio_receive_tasks.values():
+                task.cancel()
+            for task in self._audio_receive_tasks.values():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            self._audio_receive_tasks.clear()
 
-            # Close WebRTC peer connection
-            if self.peer_connection:
-                await self.peer_connection.close()
+            # Disconnect from LiveKit
+            if self._livekit_room:
+                await self._livekit_room.disconnect()
 
-            # Close TCP if still open
+            # Close TCP connection
             if self.writer:
                 self.writer.close()
                 try:
@@ -684,16 +661,8 @@ class GameClient:
                 self._temp_dir.cleanup()
             self.ui.cleanup()
 
-    async def _handle_data_channel_message(self, data: bytes) -> None:
-        """Handle a message received via WebRTC data channel."""
-        if len(data) < 1:
-            return
-        msg_type = MessageType(data[0])
-        payload = data[1:]
-        await self._handle_server_message(msg_type, payload)
-
     async def _receive_messages(self) -> None:
-        """Receive and handle messages from server (legacy TCP, not used with WebRTC)."""
+        """Receive and handle messages from server over TCP."""
         try:
             while self.running and self.reader:
                 msg_type, payload = await read_message(self.reader)
@@ -771,20 +740,18 @@ class GameClient:
             if left_player_name:
                 if self.audio_playback:
                     self.audio_playback.remove_player(left_player_name)
-                # Also clean up the playback track
-                if left_player_name in self.audio_playback_tracks:
-                    track = self.audio_playback_tracks.pop(left_player_name)
-                    asyncio.create_task(track.stop())
+                # Cancel audio receive task for this player
+                task = self._audio_receive_tasks.pop(left_player_name, None)
+                if task:
+                    task.cancel()
             self._needs_render = True
-
-        # AUDIO_FRAME is not used with WebRTC - audio comes via track
 
         elif msg_type == MessageType.DOOR_TRANSITION:
             await self._handle_door_transition(payload)
 
         elif msg_type == MessageType.PING:
             # Respond with PONG to keep connection alive
-            self._send_data_channel_message(MessageType.PONG, b"")
+            await self._send_message(MessageType.PONG, b"")
 
         elif msg_type == MessageType.LEVEL_PACK_DATA:
             # Handle level pack data (for door transitions)
@@ -804,65 +771,28 @@ class GameClient:
             if self._pending_files_future:
                 self._pending_files_future.set_result(payload)
 
-        elif msg_type == MessageType.WEBRTC_OFFER:
-            # Renegotiation offer from server (new audio tracks)
-            _logger.debug("Received WEBRTC_OFFER for renegotiation")
-            offer_sdp = deserialize_webrtc_offer(payload)
-            await self._handle_renegotiation_offer(offer_sdp)
-
-        elif msg_type == MessageType.AUDIO_TRACK_MAP:
-            # Update track MID -> source player ID mapping
-            self._track_map = deserialize_audio_track_map(payload)
-            _logger.debug(f"Received AUDIO_TRACK_MAP: {self._track_map}")
-
-    def _send_data_channel_message(self, msg_type: MessageType, payload: bytes) -> None:
-        """Send a message via WebRTC data channel."""
-        if not self.webrtc_connected or self.data_channel is None:
+    async def _send_message(self, msg_type: MessageType, payload: bytes) -> None:
+        """Send a message to the server via TCP."""
+        if self.writer is None:
             return
         try:
-            message = bytes([msg_type]) + payload
-            self.data_channel.send(message)
-        except Exception:
-            pass
+            await write_message(self.writer, msg_type, payload)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self.running = False
 
-    async def _request_level_pack(self, level_name: str) -> bytes | None:
-        """Request a level pack via data channel and wait for response."""
-        if not self.webrtc_connected:
-            return None
-
-        # Create a future to wait for the response
-        self._pending_level_pack_future: asyncio.Future[bytes] = asyncio.Future()
-
-        # Send request
-        self._send_data_channel_message(
-            MessageType.LEVEL_PACK_REQUEST,
-            serialize_level_pack_request(level_name),
-        )
-
-        # Wait for response with timeout
-        try:
-            payload = await asyncio.wait_for(
-                self._pending_level_pack_future, timeout=10.0
-            )
-            return deserialize_level_pack_data(payload)
-        except asyncio.TimeoutError:
-            return None
-        finally:
-            self._pending_level_pack_future = None  # type: ignore[assignment]
-
-    async def _request_level_cached_dc(
+    async def _request_level_cached(
         self, level_name: str, extract_dir: Path
     ) -> LevelPack | None:
-        """Request level files via data channel using content-addressed caching.
+        """Request level files via TCP using content-addressed caching.
 
         This is used during gameplay for door transitions and portal level loading.
         """
-        if not self.webrtc_connected:
+        if self.writer is None or self.reader is None:
             return None
 
         # Request manifest
         self._pending_manifest_future = asyncio.Future()
-        self._send_data_channel_message(
+        await self._send_message(
             MessageType.LEVEL_MANIFEST_REQUEST,
             serialize_level_manifest_request(level_name),
         )
@@ -889,7 +819,7 @@ class GameClient:
         if missing_files:
             # Request missing files from server
             self._pending_files_future = asyncio.Future()
-            self._send_data_channel_message(
+            await self._send_message(
                 MessageType.LEVEL_FILES_REQUEST,
                 serialize_level_files_request(level_name, missing_files),
             )
@@ -933,9 +863,6 @@ class GameClient:
         """Handle a door transition to a new level."""
         target_level, spawn_x, spawn_y = deserialize_door_transition(payload)
 
-        if not self.webrtc_connected:
-            return
-
         # Clear pending moves immediately to prevent rubber banding
         # (POSITION_ACK may arrive while we're loading the new level)
         self._pending_moves.clear()
@@ -947,7 +874,7 @@ class GameClient:
         extract_dir = Path(self._temp_dir.name)
 
         # Request level files using content-addressed caching
-        level_pack = await self._request_level_cached_dc(target_level, extract_dir)
+        level_pack = await self._request_level_cached(target_level, extract_dir)
         if level_pack is None:
             return
 
@@ -1017,7 +944,7 @@ class GameClient:
 
     async def _load_see_through_portal_levels(self) -> None:
         """Load other levels needed for see-through portals."""
-        if not self.level or not self.level.doors or not self.webrtc_connected:
+        if not self.level or not self.level.doors:
             return
 
         # Collect unique cross-level targets from see-through portals
@@ -1036,7 +963,7 @@ class GameClient:
             extract_dir = Path(self._temp_dir.name) / f"other_{target_level_name}"
 
             # Request level files using content-addressed caching
-            level_pack = await self._request_level_cached_dc(
+            level_pack = await self._request_level_cached(
                 target_level_name, extract_dir
             )
             if level_pack is None:
@@ -1162,7 +1089,7 @@ class GameClient:
                 return
 
             # Normal movement
-            if self.webrtc_connected and self._position_queue:
+            if self._position_queue:
                 # Rate limit movement (max 1 tile per tick interval)
                 now = time.monotonic()
                 if now - self._last_move_time < MOVEMENT_TICK_INTERVAL:
@@ -1208,8 +1135,8 @@ class GameClient:
         """Toggle mute state."""
         self.is_muted = not self.is_muted
         self._needs_render = True
-        # Send mute status via data channel
-        self._send_data_channel_message(
+        # Send mute status via TCP
+        await self._send_message(
             MessageType.MUTE_STATUS, serialize_mute_status(self.is_muted)
         )
         if self.audio_capture:
@@ -1228,10 +1155,8 @@ class GameClient:
         # Update audio streams based on nearby stream sources
         self._stream_player.update_streams(self.x, self.y, self.level)
 
-        # Get mic level from WebRTC audio track or legacy capture
-        if self.audio_capture_track:
-            mic_level = self.audio_capture_track.last_level
-        elif self.audio_capture:
+        # Get mic level from audio capture
+        if self.audio_capture:
             mic_level = self.audio_capture.last_level
         else:
             mic_level = 0.0
@@ -1289,11 +1214,7 @@ class GameClient:
             self.audio_playback = AudioPlayback()
             self.audio_playback.start()
 
-            # Add any tracks that arrived before audio_playback was ready
-            for player_name, track in self.audio_playback_tracks.items():
-                self.audio_playback.add_playback_track(player_name, track)
-
-            # Start capture - feed audio to WebRTC track
+            # Start capture - feed audio to LiveKit audio source
             self.audio_capture = AudioCapture(self._on_audio_frame)
             self.audio_capture.start()
         except ImportError:
@@ -1312,7 +1233,7 @@ class GameClient:
         self._stream_player.stop()
 
     async def _send_position_updates(self) -> None:
-        """Send position updates from the queue to the server via data channel."""
+        """Send position updates from the queue to the server via TCP."""
         while self.running:
             try:
                 if self._position_queue is None:
@@ -1321,23 +1242,41 @@ class GameClient:
                 seq, x, y = await asyncio.wait_for(
                     self._position_queue.get(), timeout=0.1
                 )
-                if self.webrtc_connected:
-                    payload = serialize_position_update(seq, x, y)
-                    self._send_data_channel_message(
-                        MessageType.POSITION_UPDATE, payload
-                    )
+                payload = serialize_position_update(seq, x, y)
+                await self._send_message(MessageType.POSITION_UPDATE, payload)
             except asyncio.TimeoutError:
                 continue
 
     def _on_audio_frame(self, pcm_data: Any, timestamp_ms: int) -> None:
         """Callback when audio frame is captured (called from audio thread).
 
-        With WebRTC, we feed the raw PCM data to the audio capture track
-        instead of encoding to Opus (WebRTC handles encoding).
+        With LiveKit, we feed the raw PCM data to the LiveKit AudioSource
+        which handles encoding and transmission.
         """
         if self.is_muted or not self._loop or not self.running:
             return
 
-        # Feed audio to WebRTC track (thread-safe)
-        if self.audio_capture_track:
-            self.audio_capture_track.feed_audio(pcm_data)
+        # Feed audio to LiveKit audio source (thread-safe bridge)
+        if self._livekit_audio_source:
+            import numpy as np
+
+            # Convert float32 PCM to int16 (LiveKit expects int16)
+            if isinstance(pcm_data, np.ndarray):
+                int16_data = (pcm_data * 32767).clip(-32768, 32767).astype(np.int16)
+            else:
+                int16_data = pcm_data
+
+            frame = livekit_rtc.AudioFrame(
+                data=int16_data.tobytes(),
+                sample_rate=SAMPLE_RATE,
+                num_channels=1,
+                samples_per_channel=len(int16_data),
+            )
+            # capture_frame is async; bridge from audio thread to event loop
+            audio_source = self._livekit_audio_source
+            if audio_source is not None:
+                self._loop.call_soon_threadsafe(
+                    lambda f=frame: asyncio.ensure_future(  # type: ignore[misc]
+                        audio_source.capture_frame(f)
+                    )
+                )

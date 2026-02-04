@@ -25,8 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("piano_bot")
 # Silence noisy loggers
-logging.getLogger("aiortc").setLevel(logging.WARNING)
-logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("livekit").setLevel(logging.WARNING)
 
 
 # Path to the piano audio file (relative to this script)

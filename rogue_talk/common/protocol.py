@@ -11,7 +11,6 @@ class MessageType(enum.IntEnum):
     SERVER_HELLO = 0x02
     POSITION_UPDATE = 0x03
     WORLD_STATE = 0x04
-    AUDIO_FRAME = 0x05
     PLAYER_JOINED = 0x06
     PLAYER_LEFT = 0x07
     MUTE_STATUS = 0x08
@@ -28,11 +27,8 @@ class MessageType(enum.IntEnum):
     AUTH_RESULT = 0x22  # Server -> Client: success/error code
     PING = 0x30  # Server -> Client: keepalive ping
     PONG = 0x31  # Client -> Server: keepalive pong
-    # WebRTC signaling messages (used over initial TCP for handshake)
-    WEBRTC_OFFER = 0x40  # Client -> Server: SDP offer
-    WEBRTC_ANSWER = 0x41  # Server -> Client: SDP answer
-    WEBRTC_ICE = 0x42  # Bidirectional: ICE candidate exchange
-    AUDIO_TRACK_MAP = 0x43  # Server -> Client: Maps track MIDs to player IDs
+    # LiveKit token message (sent after auth, client uses to connect to LiveKit SFU)
+    LIVEKIT_TOKEN = 0x50  # Server -> Client: LiveKit URL + access token
 
 
 @dataclass
@@ -49,14 +45,6 @@ class PlayerInfo:
 @dataclass
 class WorldState:
     players: list[PlayerInfo]
-
-
-@dataclass
-class AudioFrame:
-    player_id: int
-    timestamp_ms: int
-    volume: float  # 0.0 to 1.0, set by server based on distance
-    opus_data: bytes
 
 
 async def read_message(reader: StreamReader) -> tuple[MessageType, bytes]:
@@ -178,23 +166,6 @@ def deserialize_world_state(data: bytes) -> WorldState:
             PlayerInfo(player_id, x, y, bool(is_muted), name, level, ping_ms)
         )
     return WorldState(players)
-
-
-# AUDIO_FRAME: player_id, timestamp_ms, volume (as uint16 0-65535), opus_data
-def serialize_audio_frame(frame: AudioFrame) -> bytes:
-    volume_int = int(frame.volume * 65535)
-    return (
-        struct.pack(">IIH", frame.player_id, frame.timestamp_ms, volume_int)
-        + struct.pack(">H", len(frame.opus_data))
-        + frame.opus_data
-    )
-
-
-def deserialize_audio_frame(data: bytes) -> AudioFrame:
-    player_id, timestamp_ms, volume_int = struct.unpack(">IIH", data[:10])
-    opus_len = struct.unpack(">H", data[10:12])[0]
-    opus_data = data[12 : 12 + opus_len]
-    return AudioFrame(player_id, timestamp_ms, volume_int / 65535.0, opus_data)
 
 
 # PLAYER_JOINED: player_id, name
@@ -395,73 +366,23 @@ def deserialize_auth_result(data: bytes) -> AuthResult:
     return AuthResult(struct.unpack("B", data[:1])[0])
 
 
-# WEBRTC_OFFER: SDP string (UTF-8 encoded, length-prefixed)
-def serialize_webrtc_offer(sdp: str) -> bytes:
-    sdp_bytes = sdp.encode("utf-8")
-    return struct.pack(">I", len(sdp_bytes)) + sdp_bytes
-
-
-def deserialize_webrtc_offer(data: bytes) -> str:
-    sdp_len = struct.unpack(">I", data[:4])[0]
-    return data[4 : 4 + sdp_len].decode("utf-8")
-
-
-# WEBRTC_ANSWER: SDP string (UTF-8 encoded, length-prefixed)
-def serialize_webrtc_answer(sdp: str) -> bytes:
-    sdp_bytes = sdp.encode("utf-8")
-    return struct.pack(">I", len(sdp_bytes)) + sdp_bytes
-
-
-def deserialize_webrtc_answer(data: bytes) -> str:
-    sdp_len = struct.unpack(">I", data[:4])[0]
-    return data[4 : 4 + sdp_len].decode("utf-8")
-
-
-# WEBRTC_ICE: ICE candidate (sdpMid, sdpMLineIndex, candidate string)
-def serialize_webrtc_ice(
-    sdp_mid: str | None, sdp_mline_index: int | None, candidate: str
-) -> bytes:
-    # Handle None values
-    mid_bytes = (sdp_mid or "").encode("utf-8")
-    idx = sdp_mline_index if sdp_mline_index is not None else 0
-    cand_bytes = candidate.encode("utf-8")
+# LIVEKIT_TOKEN: URL + access token for connecting to LiveKit SFU
+def serialize_livekit_token(url: str, token: str) -> bytes:
+    url_bytes = url.encode("utf-8")
+    token_bytes = token.encode("utf-8")
     return (
-        struct.pack(">H", len(mid_bytes))
-        + mid_bytes
-        + struct.pack(">H", idx)
-        + struct.pack(">I", len(cand_bytes))
-        + cand_bytes
+        struct.pack(">H", len(url_bytes))
+        + url_bytes
+        + struct.pack(">I", len(token_bytes))
+        + token_bytes
     )
 
 
-def deserialize_webrtc_ice(data: bytes) -> tuple[str | None, int | None, str]:
-    offset = 0
-    mid_len = struct.unpack(">H", data[offset : offset + 2])[0]
-    offset += 2
-    sdp_mid = data[offset : offset + mid_len].decode("utf-8") if mid_len > 0 else None
-    offset += mid_len
-    sdp_mline_index = struct.unpack(">H", data[offset : offset + 2])[0]
-    offset += 2
-    cand_len = struct.unpack(">I", data[offset : offset + 4])[0]
+def deserialize_livekit_token(data: bytes) -> tuple[str, str]:
+    url_len = struct.unpack(">H", data[:2])[0]
+    url = data[2 : 2 + url_len].decode("utf-8")
+    offset = 2 + url_len
+    token_len = struct.unpack(">I", data[offset : offset + 4])[0]
     offset += 4
-    candidate = data[offset : offset + cand_len].decode("utf-8")
-    return sdp_mid, sdp_mline_index, candidate
-
-
-# AUDIO_TRACK_MAP: Maps track MIDs to source player IDs
-def serialize_audio_track_map(track_map: dict[str, int]) -> bytes:
-    """Serialize a mapping of track MID -> source player ID."""
-    import json
-
-    json_bytes = json.dumps(track_map).encode("utf-8")
-    return struct.pack(">I", len(json_bytes)) + json_bytes
-
-
-def deserialize_audio_track_map(data: bytes) -> dict[str, int]:
-    """Deserialize a mapping of track MID -> source player ID."""
-    import json
-    from typing import cast
-
-    json_len = struct.unpack(">I", data[:4])[0]
-    json_bytes = data[4 : 4 + json_len]
-    return cast(dict[str, int], json.loads(json_bytes.decode("utf-8")))
+    token = data[offset : offset + token_len].decode("utf-8")
+    return url, token
