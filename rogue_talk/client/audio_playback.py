@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import numpy.typing as npt
@@ -31,12 +31,18 @@ class PlayerAudioStream:
     """Audio output stream for a single player's voice using PyAV backend."""
 
     # Buffer settings - balance between latency and jitter handling
-    # Larger buffers help with network jitter and clock drift between sender/receiver
-    MIN_BUFFER = FRAME_SIZE * 5  # 100ms before starting playback
+    # With VAD (voice activity detection), audio arrives in bursts during speech
+    # Lower MIN_BUFFER reduces latency at speech onset
+    MIN_BUFFER = FRAME_SIZE * 2  # 40ms before starting playback
     MAX_BUFFER = FRAME_SIZE * 20  # 400ms max buffer
-    TARGET_BUFFER = FRAME_SIZE * 10  # 200ms target - maintain around this level
+    TARGET_BUFFER = FRAME_SIZE * 5  # 100ms target - maintain around this level
 
-    def __init__(self, player_id: int, player_name: str = "") -> None:
+    def __init__(
+        self,
+        player_id: int,
+        player_name: str = "",
+        get_volume: "Callable[[], float] | None" = None,
+    ) -> None:
         self.player_id = player_id
         self.player_name = player_name or f"player_{player_id}"
         self._ring_buffer = np.zeros(self.MAX_BUFFER * 2, dtype=np.float32)
@@ -47,6 +53,8 @@ class PlayerAudioStream:
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
+        # Volume callback - called at playback time, not poll time
+        self._get_volume = get_volume
         # Counters for debugging audio issues
         self._overflow_count = 0
         self._underrun_count = 0
@@ -82,9 +90,12 @@ class PlayerAudioStream:
             self._stream.stop()
             self._stream = None
 
-    def feed_audio(self, pcm_data: npt.NDArray[np.float32], volume: float) -> None:
-        """Feed audio data into the ring buffer (thread-safe)."""
-        samples = pcm_data.flatten() * volume
+    def feed_audio(self, pcm_data: npt.NDArray[np.float32]) -> None:
+        """Feed audio data into the ring buffer (thread-safe).
+
+        Volume is applied at playback time, not here, to keep this fast.
+        """
+        samples = pcm_data.flatten()
         sample_len = len(samples)
 
         with self._lock:
@@ -150,6 +161,12 @@ class PlayerAudioStream:
                     f"overflows={self._overflow_count}, buffer={buffer_samples}"
                 )
 
+            # Apply volume at playback time (not in poll thread)
+            if self._get_volume is not None:
+                volume = self._get_volume()
+                if volume != 1.0:
+                    frame = frame * volume
+
             # Write to output stream
             self._stream.write(frame)
 
@@ -191,10 +208,10 @@ class PlayerAudioStream:
                 self._read_pos = end_pos % buf_size
                 return frame, False
             else:
-                # Underrun - return silence but DON'T reset _started
-                # Resetting would require rebuffering MIN_BUFFER (60ms) which
-                # causes noticeable audio gaps. Instead, just play silence for
-                # this frame and resume immediately when data arrives.
+                # Buffer empty - reset _started so we re-buffer when speech resumes
+                # With VAD, this happens during silence periods between speech
+                # Re-buffering adds ~40ms latency but prevents choppy speech onsets
+                self._started = False
                 return np.zeros(FRAME_SIZE, dtype=np.float32), True
 
 
@@ -328,14 +345,28 @@ class AudioPlayback:
 
             # PlayerAudioStream needs an ID for PulseAudio sink naming - use hash of name
             player_id = hash(player_name) & 0x7FFFFFFF  # Positive int
-            stream = PlayerAudioStream(player_id, player_name)
+
+            # Pass volume callback so volume is calculated at playback time, not poll time
+            # Capture player_name in default arg to avoid late binding issues
+            def make_volume_getter(pn: str) -> Callable[[], float]:
+                return lambda: self._get_proximity_volume(pn)
+
+            stream = PlayerAudioStream(
+                player_id,
+                player_name,
+                get_volume=make_volume_getter(player_name),
+            )
             stream.start()
             self._player_streams[player_name] = stream
             _logger.debug(f"Created and started PlayerAudioStream for {player_name}")
             return stream
 
     def _poll_webrtc(self) -> None:
-        """Poll all WebRTC tracks for frames and route to player streams."""
+        """Poll all WebRTC tracks for frames and route to player streams.
+
+        This loop should be fast - just move data from WebRTC to ring buffers.
+        Volume and other processing happens in the playback threads.
+        """
         frame_count = 0
         while self._running:
             # Get snapshot of tracks to poll
@@ -350,26 +381,20 @@ class AudioPlayback:
                         break
                     frame_count += 1
 
-                    # Apply client-side proximity volume
-                    volume = self._get_proximity_volume(player_name)
-                    if volume <= 0.0:
-                        continue
+                    # Get or create stream (volume callback is set at creation time)
+                    stream = self._get_or_create_stream(player_name)
+                    if stream is not None:
+                        stream.feed_audio(pcm_data)
 
+                    # Log periodically
                     if frame_count % 500 == 1:
                         _logger.debug(
                             f"Received audio frame {frame_count} from {player_name}, "
-                            f"samples={len(pcm_data)}, volume={volume:.2f}"
+                            f"samples={len(pcm_data)}"
                         )
-                    stream = self._get_or_create_stream(player_name)
-                    if stream is not None:
-                        stream.feed_audio(pcm_data, volume)
-                        # Log audio level periodically
-                        if frame_count % 500 == 1:
-                            level = float(np.abs(pcm_data).max())
-                            _logger.debug(
-                                f"Audio level from {player_name}: {level:.4f}"
-                            )
-                    # else: player is out of range, discard audio
+                        # Log audio level
+                        level = float(np.abs(pcm_data).max())
+                        _logger.debug(f"Audio level from {player_name}: {level:.4f}")
 
             # Sleep briefly to avoid busy-waiting
             time.sleep(0.005)  # 5ms
