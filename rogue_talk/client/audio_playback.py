@@ -30,12 +30,10 @@ _logger.setLevel(logging.DEBUG)
 class PlayerAudioStream:
     """Audio output stream for a single player's voice using PyAV backend."""
 
-    # Buffer settings - balance between latency and jitter handling
-    # With VAD (voice activity detection), audio arrives in bursts during speech
-    # Lower MIN_BUFFER reduces latency at speech onset
-    MIN_BUFFER = FRAME_SIZE * 2  # 40ms before starting playback
-    MAX_BUFFER = FRAME_SIZE * 20  # 400ms max buffer
-    TARGET_BUFFER = FRAME_SIZE * 5  # 100ms target - maintain around this level
+    # Buffer settings - minimize latency
+    MIN_BUFFER = FRAME_SIZE * 1  # 20ms before starting playback
+    MAX_BUFFER = FRAME_SIZE * 5  # 100ms max buffer
+    TARGET_BUFFER = FRAME_SIZE * 2  # 40ms target
 
     def __init__(
         self,
@@ -123,35 +121,18 @@ class PlayerAudioStream:
 
     def _playback_loop(self) -> None:
         """Background thread that reads from ring buffer and writes to audio output."""
-        base_frame_duration = FRAME_SIZE / SAMPLE_RATE
-        # Use absolute timing to prevent drift
+        frame_duration = FRAME_SIZE / SAMPLE_RATE
         next_frame_time = time.perf_counter()
 
         while self._running and self._stream is not None:
-            # Get current buffer level for adaptive timing
+            # Get current buffer level
             with self._lock:
                 buf_size = len(self._ring_buffer)
                 buffer_samples = (self._write_pos - self._read_pos) % buf_size
 
-            # Adaptive clock drift compensation:
-            # Adjust playback speed based on buffer level relative to target
-            # This compensates for clock differences between sender and receiver
-            if buffer_samples < self.TARGET_BUFFER // 2:
-                # Buffer getting low - slow down by 5% to let it fill
-                frame_duration = base_frame_duration * 1.05
-            elif buffer_samples > self.TARGET_BUFFER * 3 // 2:
-                # Buffer getting high - speed up by 5% to drain it
-                frame_duration = base_frame_duration * 0.95
-            else:
-                # Buffer healthy - normal speed
-                frame_duration = base_frame_duration
-
-            # Generate the next frame from ring buffer
-            frame, is_underrun = self._get_frame_with_status()
+            # Get frame (silence if buffer empty)
+            frame = self._get_frame()
             self._frame_count += 1
-
-            if is_underrun:
-                self._underrun_count += 1
 
             # Log stats periodically (every ~10 seconds)
             if self._frame_count % 500 == 1:
@@ -170,27 +151,26 @@ class PlayerAudioStream:
             # Write to output stream
             self._stream.write(frame)
 
-            # Sleep until next frame time (absolute timing prevents drift)
+            # Maintain timing
             next_frame_time += frame_duration
             sleep_time = next_frame_time - time.perf_counter()
             if sleep_time > 0:
                 time.sleep(sleep_time)
             elif sleep_time < -0.1:
-                # We're way behind - reset timing to catch up
                 next_frame_time = time.perf_counter()
 
-    def _get_frame_with_status(self) -> tuple[npt.NDArray[np.float32], bool]:
-        """Get the next audio frame from ring buffer with underrun status."""
+    def _get_frame(self) -> npt.NDArray[np.float32]:
+        """Get the next audio frame from ring buffer, or silence if empty."""
         with self._lock:
             buf_size = len(self._ring_buffer)
             buffer_len = (self._write_pos - self._read_pos) % buf_size
 
+            # Need MIN_BUFFER before starting
             if not self._started:
                 if buffer_len >= self.MIN_BUFFER:
                     self._started = True
                 else:
-                    # Still buffering - not a real underrun
-                    return np.zeros(FRAME_SIZE, dtype=np.float32), False
+                    return np.zeros(FRAME_SIZE, dtype=np.float32)
 
             if buffer_len >= FRAME_SIZE:
                 read_pos = self._read_pos
@@ -206,13 +186,11 @@ class PlayerAudioStream:
                         ]
                     )
                 self._read_pos = end_pos % buf_size
-                return frame, False
+                return frame
             else:
-                # Buffer empty - reset _started so we re-buffer when speech resumes
-                # With VAD, this happens during silence periods between speech
-                # Re-buffering adds ~40ms latency but prevents choppy speech onsets
-                self._started = False
-                return np.zeros(FRAME_SIZE, dtype=np.float32), True
+                # Buffer empty - return silence, don't reset _started
+                self._underrun_count += 1
+                return np.zeros(FRAME_SIZE, dtype=np.float32)
 
 
 class AudioPlayback:

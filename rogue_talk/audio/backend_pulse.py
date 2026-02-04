@@ -45,9 +45,9 @@ class PulseOutputStream(AudioOutputStream):
         self._stream: Any | None = None
         self._running = False
         self._thread: threading.Thread | None = None
-        # Buffer to handle timing jitter (~200ms at 20ms/frame)
+        # Small buffer - just enough for thread handoff (~60ms at 20ms/frame)
         self._queue: queue.Queue[npt.NDArray[np.float32] | None] = queue.Queue(
-            maxsize=10
+            maxsize=3
         )
         self._pts = 0
         self._drop_count = 0
@@ -58,12 +58,17 @@ class PulseOutputStream(AudioOutputStream):
         if self._running:
             return
 
-        # Open PulseAudio output via ffmpeg
+        # Open PulseAudio output via ffmpeg with low-latency settings
+        # buffer_size in bytes: 960 samples * 4 bytes (float32) = 3840 bytes per frame
+        # Use 2 frames worth for low latency
         self._container = av.open(
             "default",
             mode="w",
             format="pulse",
-            options={"name": f"{APPLICATION_NAME}:{self.stream_name}"},
+            options={
+                "name": f"{APPLICATION_NAME}:{self.stream_name}",
+                "buffer_size": "7680",  # 2 frames = 40ms
+            },
         )
 
         # Add audio stream with layout parameter (not attribute assignment)
